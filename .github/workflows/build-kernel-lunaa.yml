@@ -10,6 +10,10 @@ name: Build kernel (lunaa)
 # and the KSU/SUSFS options in lahaina-qgki_defconfig. Nothing must be
 # downloaded or patched on top of it (that was the cause of the previous
 # failures). The only thing needed for kernel 5.4 is the pgtable.h fix below.
+#
+# ksu_source=latest replaces ONLY drivers/kernelsu with the newest KernelSU Next
+# that supports 5.4 + SUSFS and ports the one hook the old tree needs. If that
+# does not compile/link, the workflow restores the built-in version and rebuilds.
 
 on:
   workflow_dispatch:
@@ -35,10 +39,26 @@ on:
         required: false
         default: ""
       ksu:
-        description: "Build with the KernelSU Next + SUSFS that are already in the tree (false = CONFIG_KSU off)"
+        description: "Build with KernelSU Next (false = CONFIG_KSU off)"
         type: boolean
         required: true
         default: true
+      ksu_source:
+        description: "latest = newest KernelSU Next (auto-falls back to the built-in one if it does not build), builtin = version already in the kernel tree"
+        type: choice
+        required: true
+        default: "latest"
+        options:
+          - latest
+          - builtin
+      ksu_repo:
+        description: "Repo for 'latest' (newest KernelSU Next for non-GKI 5.4 with SUSFS support)"
+        required: true
+        default: "sidex15/KernelSU-Next"
+      ksu_branch:
+        description: "Branch for 'latest'"
+        required: true
+        default: "legacy-susfs-v2"
       clang_repo:
         description: "Clang toolchain git repo"
         required: true
@@ -97,21 +117,80 @@ jobs:
           printf '%s' "$SUFFIX" > .scmversion
           echo "scmversion: $SUFFIX"
 
-      - name: Check built-in KernelSU / SUSFS and fix kernel 5.4 compatibility
+      - name: Prepare KernelSU Next
+        if: inputs.ksu
         working-directory: kernel
+        env:
+          KSU_SOURCE: ${{ inputs.ksu_source }}
+          KSU_REPO: ${{ inputs.ksu_repo }}
+          KSU_BRANCH: ${{ inputs.ksu_branch }}
         run: |
+          set -uo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/build.log") 2>&1
+
           echo "== built-in KernelSU / SUSFS"
           ls -d drivers/kernelsu fs/susfs.c include/linux/susfs.h
           grep -n "define SUSFS_VERSION" include/linux/susfs.h || true
-          grep -n "KSU" arch/arm64/configs/vendor/lahaina-qgki_defconfig | head -20
 
           # Kernel 5.4 has no linux/pgtable.h (added in 5.8); asm/pgtable.h is the 5.4 equivalent.
-          # KernelSU's feature/sucompat.c includes the new header and breaks the build.
-          if [ ! -f include/linux/pgtable.h ]; then
-            grep -rl 'linux/pgtable.h' drivers/kernelsu | xargs -r sed -i 's|<linux/pgtable.h>|<asm/pgtable.h>|'
-            echo "== patched includes:"
-            grep -rn 'pgtable.h' drivers/kernelsu || true
+          fix_pgtable() {
+            if [ ! -f include/linux/pgtable.h ]; then
+              grep -rl 'linux/pgtable.h' "$1" 2>/dev/null | xargs -r sed -i 's|<linux/pgtable.h>|<asm/pgtable.h>|'
+              echo "pgtable.h include fixed in $1"
+            fi
+          }
+
+          fix_pgtable drivers/kernelsu
+          rm -rf "$GITHUB_WORKSPACE/ksu_builtin"
+          cp -a drivers/kernelsu "$GITHUB_WORKSPACE/ksu_builtin"
+
+          # helper used by the Build step to fall back to the built-in version
+          cat > "$GITHUB_WORKSPACE/restore_builtin.sh" <<'EOS'
+          set -e
+          cd "$GITHUB_WORKSPACE/kernel"
+          rm -rf drivers/kernelsu KernelSU-Next
+          cp -a "$GITHUB_WORKSPACE/ksu_builtin" drivers/kernelsu
+          EOS
+          sed -i 's/^          //' "$GITHUB_WORKSPACE/restore_builtin.sh"
+
+          try_latest() {
+            rm -rf KernelSU-Next
+            # full clone on purpose: Kbuild derives version and tag from git history
+            git clone --single-branch -b "$KSU_BRANCH" "https://github.com/$KSU_REPO" KernelSU-Next || return 1
+            [ -d KernelSU-Next/kernel/core ] || return 1
+            rm -rf drivers/kernelsu
+            ln -sfn ../KernelSU-Next/kernel drivers/kernelsu
+            fix_pgtable KernelSU-Next/kernel
+
+            # fs/stat.c of this tree calls ksu_handle_vfs_fstat() (adjusts init.rc size
+            # so the injected ksud rc is read completely). Newer KernelSU dropped it,
+            # so port the function from the built-in version instead of stubbing it.
+            if ! grep -rq "ksu_handle_vfs_fstat" KernelSU-Next/kernel; then
+              awk '/^void ksu_handle_vfs_fstat/{p=1} p{print} p&&/^}/{exit}' \
+                "$GITHUB_WORKSPACE/ksu_builtin/runtime/ksud_integration.c" > "$GITHUB_WORKSPACE/vfs_fstat.c"
+              [ -s "$GITHUB_WORKSPACE/vfs_fstat.c" ] || { echo "could not extract ksu_handle_vfs_fstat"; return 1; }
+              {
+                echo
+                echo "/* ported from the built-in KernelSU: called from fs/stat.c of this kernel tree */"
+                cat "$GITHUB_WORKSPACE/vfs_fstat.c"
+              } >> KernelSU-Next/kernel/runtime/ksud_integration.c
+              echo "ksu_handle_vfs_fstat ported"
+            fi
+            git -C KernelSU-Next log -1 --format='KernelSU-Next commit: %h %ad %s'
+            git -C KernelSU-Next describe --tags --always 2>/dev/null || true
+          }
+
+          KSU_USED=builtin
+          if [ "$KSU_SOURCE" = "latest" ]; then
+            if try_latest; then
+              KSU_USED=latest
+            else
+              echo "::warning::Could not set up the latest KernelSU Next - using the built-in version"
+              bash "$GITHUB_WORKSPACE/restore_builtin.sh"
+            fi
           fi
+          echo "KSU_USED=$KSU_USED" >> "$GITHUB_ENV"
+          echo "KernelSU source in use: $KSU_USED"
 
       - name: Clone clang
         run: |
@@ -133,9 +212,16 @@ jobs:
           for frag in $EXTRA_CONFIGS; do
             $MK "$frag"
           done
+          # config exactly as the tree defines it; used if we have to fall back
+          cp out/.config out/.config.builtin
 
           if [ "$WANT_KSU" != "true" ]; then
             scripts/config --file out/.config -d KSU
+            $MK olddefconfig
+          elif [ "${KSU_USED:-builtin}" = "latest" ]; then
+            # the newest KernelSU expects the SUSFS 2.0 try_umount / memfd API,
+            # the SUSFS v2.1.0 in this tree does not provide it
+            scripts/config --file out/.config -d KSU_SUSFS_TRY_UMOUNT -d KSU_SUSFS_SUS_MEMFD
             $MK olddefconfig
           fi
 
@@ -153,7 +239,24 @@ jobs:
           export ARCH=arm64 SUBARCH=arm64
           MK="make O=out CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
 
-          if ! $MK -j"$(nproc)" Image modules 2>&1 | tee ../build.log; then
+          build() { $MK -j"$(nproc)" Image modules 2>&1 | tee -a ../build.log; }
+
+          FAILED=0
+          if ! build; then
+            if [ "${KSU_USED:-builtin}" = "latest" ]; then
+              echo "::warning::Build failed with the latest KernelSU Next - falling back to the built-in version"
+              grep -nE "error:|\*\*\*|undefined reference" ../build.log | head -15 || true
+              bash "$GITHUB_WORKSPACE/restore_builtin.sh"
+              cp out/.config.builtin out/.config
+              $MK olddefconfig
+              echo "KSU_USED=builtin" >> "$GITHUB_ENV"
+              build || FAILED=1
+            else
+              FAILED=1
+            fi
+          fi
+
+          if [ "$FAILED" = "1" ]; then
             echo "::group::First errors"
             grep -nE "error:|\*\*\*|undefined reference" ../build.log | head -20 || true
             echo "::endgroup::"
@@ -226,6 +329,7 @@ jobs:
           {
             echo "### Build summary"
             echo "- Kernel release: \`$(cat kernel/out/include/config/kernel.release 2>/dev/null || echo n/a)\`"
+            echo "- KernelSU source: ${KSU_USED:-none} ($(git -C kernel/KernelSU-Next log -1 --format='%h %ad' --date=short 2>/dev/null || echo 'built-in'))"
             grep -E "^CONFIG_KSU" kernel/out/.config 2>/dev/null | sed 's/^/    /' || true
           } >> "$GITHUB_STEP_SUMMARY"
 
