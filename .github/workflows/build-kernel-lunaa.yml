@@ -5,16 +5,11 @@ name: Build kernel (lunaa)
 #                          BOARD_KERNEL_IMAGE_NAME := Image, boot header v3
 #   BoardConfig.mk (lunaa): TARGET_KERNEL_CONFIG += vendor/oplus_yupik_QGKI.config
 #
-# KernelSU / SUSFS notes (kernel 5.4):
-#   * Upstream KernelSU-Next 'dev' and the tag v3.4.2 target newer kernels and
-#     fail on 5.4 (linux/pgtable.h does not exist before 5.8). Note that
-#     setup.sh silently stays on the default branch when the ref is missing,
-#     which is how the previous run ended up on the wrong branch.
-#   * Upstream 'legacy' is for 5.4 but has no SUSFS. The fork sidex15/KernelSU-Next
-#     (branch legacy-susfs-v2) is legacy + SUSFS v2 and only needs the kernel-side
-#     patch from susfs4ksu (branch kernel-5.4).
-#   * If SUSFS cannot be applied cleanly, the build falls back to upstream legacy
-#     WITHOUT SUSFS instead of failing (set 'strict' = true to fail instead).
+# IMPORTANT: this kernel tree already ships KernelSU Next (drivers/kernelsu),
+# SUSFS v2.1.0 (fs/susfs.c, include/linux/susfs*.h), the manual hooks in fs/*
+# and the KSU/SUSFS options in lahaina-qgki_defconfig. Nothing must be
+# downloaded or patched on top of it (that was the cause of the previous
+# failures). The only thing needed for kernel 5.4 is the pgtable.h fix below.
 
 on:
   workflow_dispatch:
@@ -40,49 +35,10 @@ on:
         required: false
         default: ""
       ksu:
-        description: "Add KernelSU Next"
+        description: "Build with the KernelSU Next + SUSFS that are already in the tree (false = CONFIG_KSU off)"
         type: boolean
         required: true
         default: true
-      ksu_hook:
-        description: "KernelSU hook mode. syscall_table = for non-GKI 5.4 (recommended), kprobes = needs working kprobes, manual = kernel must already have hooks"
-        type: choice
-        required: true
-        default: "syscall_table"
-        options:
-          - syscall_table
-          - kprobes
-          - manual
-      susfs:
-        description: "Add SUSFS (falls back to no SUSFS if patches do not apply, unless strict)"
-        type: boolean
-        required: true
-        default: true
-      strict:
-        description: "Fail the build if SUSFS cannot be applied (instead of building without it)"
-        type: boolean
-        required: true
-        default: false
-      ksu_susfs_repo:
-        description: "KernelSU Next fork that already contains SUSFS support (owner/name)"
-        required: true
-        default: "sidex15/KernelSU-Next"
-      ksu_susfs_branch:
-        description: "Branch of that fork for non-GKI 5.4 + SUSFS"
-        required: true
-        default: "legacy-susfs-v2"
-      ksu_plain_branch:
-        description: "Upstream KernelSU-Next branch used when SUSFS is off or fails (legacy = 4.x/5.4 kernels)"
-        required: true
-        default: "legacy"
-      susfs_repo:
-        description: "SUSFS git repo"
-        required: true
-        default: "https://gitlab.com/simonpunk/susfs4ksu.git"
-      susfs_branch:
-        description: "SUSFS branch for your kernel version (latest commit of this branch is used)"
-        required: true
-        default: "kernel-5.4"
       clang_repo:
         description: "Clang toolchain git repo"
         required: true
@@ -132,7 +88,7 @@ jobs:
         run: |
           # Vendor modules in vendor_dlkm are matched by version magic, so the
           # kernel release string must equal the one the ROM was built with.
-          # Done before KernelSU touches the tree (avoids a "-dirty" suffix).
+          # Done before any file in the tree is touched (avoids a "-dirty" suffix).
           if [ -n "$SCMVERSION" ]; then
             SUFFIX="$SCMVERSION"
           else
@@ -141,111 +97,21 @@ jobs:
           printf '%s' "$SUFFIX" > .scmversion
           echo "scmversion: $SUFFIX"
 
-      - name: Add KernelSU Next (+ SUSFS)
-        if: inputs.ksu
+      - name: Check built-in KernelSU / SUSFS and fix kernel 5.4 compatibility
         working-directory: kernel
-        env:
-          WANT_SUSFS: ${{ inputs.susfs }}
-          STRICT: ${{ inputs.strict }}
-          KSU_SUSFS_REPO: ${{ inputs.ksu_susfs_repo }}
-          KSU_SUSFS_BRANCH: ${{ inputs.ksu_susfs_branch }}
-          KSU_PLAIN_REPO: KernelSU-Next/KernelSU-Next
-          KSU_PLAIN_BRANCH: ${{ inputs.ksu_plain_branch }}
-          SUSFS_REPO: ${{ inputs.susfs_repo }}
-          SUSFS_BRANCH: ${{ inputs.susfs_branch }}
         run: |
-          set -uo pipefail
-          exec > >(tee -a "$GITHUB_WORKSPACE/build.log") 2>&1
+          echo "== built-in KernelSU / SUSFS"
+          ls -d drivers/kernelsu fs/susfs.c include/linux/susfs.h
+          grep -n "define SUSFS_VERSION" include/linux/susfs.h || true
+          grep -n "KSU" arch/arm64/configs/vendor/lahaina-qgki_defconfig | head -20
 
-          K="$PWD"
-          ADDED="$GITHUB_WORKSPACE/susfs_added_files.txt"
-          : > "$ADDED"
-
-          # --- KernelSU Next: same layout that its setup.sh creates -----------
-          # Full (non-shallow) clone on purpose: the Kbuild derives the version
-          # and tag from git history.
-          setup_ksu() {
-            local repo="$1" branch="$2"
-            echo "== KernelSU Next: $repo @ $branch"
-            rm -rf KernelSU-Next drivers/kernelsu
-            git clone --single-branch -b "$branch" "https://github.com/$repo" KernelSU-Next || return 1
-            [ -d KernelSU-Next/kernel ] || return 1
-            ln -sfn ../KernelSU-Next/kernel drivers/kernelsu
-            grep -q "kernelsu" drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
-            grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-            # Kernel 5.4 has no linux/pgtable.h (added in 5.8); asm/pgtable.h is the 5.4 equivalent
-            if [ ! -f include/linux/pgtable.h ]; then
-              grep -rl 'linux/pgtable.h' KernelSU-Next/kernel 2>/dev/null \
-                | xargs -r sed -i 's|<linux/pgtable.h>|<asm/pgtable.h>|'
-              echo "pgtable.h include patched to asm/pgtable.h"
-            fi
-            git -C KernelSU-Next log -1 --format='KernelSU-Next commit: %h %ad %s'
-            git -C KernelSU-Next describe --tags --always 2>/dev/null || true
-          }
-
-          # --- SUSFS kernel-side patch: dry-run first, apply only if clean -----
-          apply_susfs() {
-            rm -rf "$GITHUB_WORKSPACE/susfs4ksu"
-            git clone --depth=1 -b "$SUSFS_BRANCH" "$SUSFS_REPO" "$GITHUB_WORKSPACE/susfs4ksu" || return 1
-            git -C "$GITHUB_WORKSPACE/susfs4ksu" log -1 --format='SUSFS commit: %h %ad %s'
-            local P="$GITHUB_WORKSPACE/susfs4ksu/kernel_patches"
-            find "$P" -maxdepth 2 | head -40
-
-            local KP
-            KP=$(ls "$P"/50_add_susfs_in_kernel*.patch 2>/dev/null | head -n1)
-            [ -n "$KP" ] || { echo "no kernel patch found in $P"; return 1; }
-            echo "Kernel patch: $KP"
-
-            if ! patch -p1 --dry-run --no-backup-if-mismatch < "$KP"; then
-              echo "SUSFS kernel patch does not apply cleanly (dry-run)"
-              return 1
-            fi
-
-            # new source files shipped next to the patch
-            local f rel
-            if [ -d "$P/fs" ]; then
-              for f in "$P"/fs/*; do rel="fs/$(basename "$f")"; cp -v "$f" "$rel" && echo "$rel" >> "$ADDED"; done
-            fi
-            if [ -d "$P/include/linux" ]; then
-              for f in "$P"/include/linux/*; do rel="include/linux/$(basename "$f")"; cp -v "$f" "$rel" && echo "$rel" >> "$ADDED"; done
-            fi
-
-            patch -p1 --no-backup-if-mismatch < "$KP" || return 1
-            if find . -name '*.rej' -not -path './KernelSU-Next/*' | grep -q .; then
-              find . -name '*.rej'
-              return 1
-            fi
-            grep -rhE "SUSFS_VERSION" include/linux/susfs*.h 2>/dev/null | head -3 || true
-            return 0
-          }
-
-          revert_susfs() {
-            git checkout -- . 2>/dev/null || true
-            while read -r f; do [ -n "$f" ] && rm -f "$f"; done < "$ADDED"
-            find . -name '*.rej' -o -name '*.orig' | grep -v '^./KernelSU-Next' | xargs -r rm -f
-          }
-
-          SUSFS_ON=0
-          if [ "$WANT_SUSFS" = "true" ]; then
-            if setup_ksu "$KSU_SUSFS_REPO" "$KSU_SUSFS_BRANCH" && apply_susfs; then
-              SUSFS_ON=1
-              echo "SUSFS: enabled"
-            else
-              if [ "$STRICT" = "true" ]; then
-                echo "::error::SUSFS could not be applied and strict=true"
-                exit 1
-              fi
-              echo "::warning::SUSFS could not be applied cleanly - building WITHOUT SUSFS (plain KernelSU Next $KSU_PLAIN_BRANCH)"
-              revert_susfs
-            fi
+          # Kernel 5.4 has no linux/pgtable.h (added in 5.8); asm/pgtable.h is the 5.4 equivalent.
+          # KernelSU's feature/sucompat.c includes the new header and breaks the build.
+          if [ ! -f include/linux/pgtable.h ]; then
+            grep -rl 'linux/pgtable.h' drivers/kernelsu | xargs -r sed -i 's|<linux/pgtable.h>|<asm/pgtable.h>|'
+            echo "== patched includes:"
+            grep -rn 'pgtable.h' drivers/kernelsu || true
           fi
-
-          if [ "$SUSFS_ON" = 0 ]; then
-            setup_ksu "$KSU_PLAIN_REPO" "$KSU_PLAIN_BRANCH" || { echo "::error::KernelSU Next setup failed"; exit 1; }
-          fi
-
-          echo "SUSFS_ON=$SUSFS_ON" >> "$GITHUB_ENV"
-          ls -la drivers | grep -i kernelsu || true
 
       - name: Clone clang
         run: |
@@ -259,7 +125,6 @@ jobs:
           DEFCONFIG: ${{ inputs.defconfig }}
           EXTRA_CONFIGS: ${{ inputs.extra_configs }}
           WANT_KSU: ${{ inputs.ksu }}
-          KSU_HOOK: ${{ inputs.ksu_hook }}
         run: |
           export ARCH=arm64 SUBARCH=arm64
           MK="make O=out CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
@@ -269,35 +134,17 @@ jobs:
             $MK "$frag"
           done
 
-          if [ "$WANT_KSU" = "true" ]; then
-            CFG="scripts/config --file out/.config"
-            $CFG -e KSU
-            case "$KSU_HOOK" in
-              syscall_table)
-                $CFG -d KSU_MANUAL_HOOK -d KSU_KPROBES_HOOK -e KSU_SYSCALL_TABLE_HOOK ;;
-              kprobes)
-                $CFG -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS -e KRETPROBES \
-                     -d KSU_MANUAL_HOOK -d KSU_SYSCALL_TABLE_HOOK -e KSU_KPROBES_HOOK ;;
-              manual)
-                $CFG -e KSU_MANUAL_HOOK -d KSU_KPROBES_HOOK -d KSU_SYSCALL_TABLE_HOOK ;;
-            esac
-            if [ "${SUSFS_ON:-0}" = "1" ]; then
-              # sub-options (SUS_PATH, SUS_MOUNT, SUS_KSTAT, SPOOF_UNAME, ...) default to y in Kconfig
-              $CFG -e KSU_SUSFS
-            fi
+          if [ "$WANT_KSU" != "true" ]; then
+            scripts/config --file out/.config -d KSU
             $MK olddefconfig
+          fi
 
-            echo "--- resulting KernelSU/SUSFS config"
-            grep -E "^CONFIG_(KSU|KPROBES|KRETPROBES)" out/.config || true
+          echo "--- resulting KernelSU / SUSFS config"
+          grep -E "^CONFIG_(KSU|KPROBES)" out/.config || true
 
-            if ! grep -q '^CONFIG_KSU=y' out/.config; then
-              echo "::error::CONFIG_KSU is not enabled after olddefconfig (Kconfig not hooked in?)"
-              exit 1
-            fi
-            if [ "${SUSFS_ON:-0}" = "1" ] && ! grep -q '^CONFIG_KSU_SUSFS=y' out/.config; then
-              echo "::warning::CONFIG_KSU_SUSFS was dropped by Kconfig (dependency not met) - SUSFS stays off"
-              echo "SUSFS_ON=0" >> "$GITHUB_ENV"
-            fi
+          if [ "$WANT_KSU" = "true" ]; then
+            grep -q '^CONFIG_KSU=y' out/.config || { echo "::error::CONFIG_KSU is not enabled"; exit 1; }
+            grep -q '^CONFIG_KSU_SUSFS=y' out/.config || echo "::warning::CONFIG_KSU_SUSFS is not enabled"
           fi
 
       - name: Build
@@ -306,22 +153,7 @@ jobs:
           export ARCH=arm64 SUBARCH=arm64
           MK="make O=out CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
 
-          build() { set -o pipefail; $MK -j"$(nproc)" Image modules 2>&1 | tee -a ../build.log; }
-
-          if ! build; then
-            # Safety net: if SUSFS is on and the build broke, retry once without it
-            if [ "${SUSFS_ON:-0}" = "1" ] && grep -q '^CONFIG_KSU_SUSFS=y' out/.config; then
-              echo "::warning::Build failed with SUSFS - retrying once with CONFIG_KSU_SUSFS disabled"
-              scripts/config --file out/.config -d KSU_SUSFS
-              $MK olddefconfig
-              echo "SUSFS_ON=0" >> "$GITHUB_ENV"
-              build || FAILED=1
-            else
-              FAILED=1
-            fi
-          fi
-
-          if [ "${FAILED:-0}" = "1" ]; then
+          if ! $MK -j"$(nproc)" Image modules 2>&1 | tee ../build.log; then
             echo "::group::First errors"
             grep -nE "error:|\*\*\*|undefined reference" ../build.log | head -20 || true
             echo "::endgroup::"
@@ -353,7 +185,7 @@ jobs:
           cat > ak3/anykernel.sh <<'AKEOF'
           ### AnyKernel3 Ramdisk Mod Script
           properties() { '
-          kernel.string=Custom kernel for lunaa (KernelSU Next)
+          kernel.string=Custom kernel for lunaa (KernelSU Next + SUSFS)
           do.devicecheck=0
           do.modules=0
           do.systemless=0
@@ -394,8 +226,6 @@ jobs:
           {
             echo "### Build summary"
             echo "- Kernel release: \`$(cat kernel/out/include/config/kernel.release 2>/dev/null || echo n/a)\`"
-            echo "- KernelSU: ${{ inputs.ksu }} (hook: ${{ inputs.ksu_hook }})"
-            echo "- SUSFS: $([ "${SUSFS_ON:-0}" = 1 ] && echo enabled || echo 'NOT enabled')"
             grep -E "^CONFIG_KSU" kernel/out/.config 2>/dev/null | sed 's/^/    /' || true
           } >> "$GITHUB_STEP_SUMMARY"
 
