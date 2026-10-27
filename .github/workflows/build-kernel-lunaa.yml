@@ -162,6 +162,33 @@ jobs:
             ln -sfn ../KernelSU-Next/kernel drivers/kernelsu
             fix_pgtable KernelSU-Next/kernel
 
+            # The newest KernelSU schedules 'susfs_extra_works', a work_struct that only
+            # exists in SUSFS 2.0 (link error: undefined symbol susfs_extra_works).
+            # SUSFS 2.1.0 in this tree exposes the same job as susfs_run_sus_path_loop(),
+            # which is what the built-in KernelSU calls, so provide the work item here.
+            SH=KernelSU-Next/kernel/hook/setuid_hook.c
+            if grep -q '^extern struct work_struct susfs_extra_works;' "$SH" \
+               && ! grep -rq "susfs_extra_works" include/linux fs/susfs.c; then
+          cat > "$GITHUB_WORKSPACE/susfs_extra_works_shim.c" <<'EOS'
+          #ifdef CONFIG_KSU_SUSFS_SUS_PATH
+          extern void susfs_run_sus_path_loop(void);
+          #endif
+          static void susfs_extra_works_fn(struct work_struct *work)
+          {
+          #ifdef CONFIG_KSU_SUSFS_SUS_PATH
+              susfs_run_sus_path_loop();
+          #endif
+          }
+          static DECLARE_WORK(susfs_extra_works, susfs_extra_works_fn);
+          EOS
+              sed -i "/^extern struct work_struct susfs_extra_works;/{
+          r $GITHUB_WORKSPACE/susfs_extra_works_shim.c
+          d
+          }" "$SH"
+              grep -q "DECLARE_WORK(susfs_extra_works" "$SH" || { echo "susfs_extra_works shim failed"; return 1; }
+              echo "susfs_extra_works shim added"
+            fi
+
             # fs/stat.c of this tree calls ksu_handle_vfs_fstat() (adjusts init.rc size
             # so the injected ksud rc is read completely). Newer KernelSU dropped it,
             # so port the function from the built-in version instead of stubbing it.
@@ -239,6 +266,8 @@ jobs:
           export ARCH=arm64 SUBARCH=arm64
           MK="make O=out CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
 
+          # without pipefail the exit code of 'tee' hides a failed make
+          set -o pipefail
           build() { $MK -j"$(nproc)" Image modules 2>&1 | tee -a ../build.log; }
 
           FAILED=0
