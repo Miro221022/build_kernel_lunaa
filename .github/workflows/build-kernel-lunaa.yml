@@ -299,17 +299,6 @@ jobs:
           $MK -j"$(nproc)" dtbs 2>&1 | tee -a ../build.log || true
           echo "Kernel release: $(cat out/include/config/kernel.release)"
 
-      - name: Make boot.img (header v3, kernel only)
-        run: |
-          git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg
-          python3 mkbootimg/mkbootimg.py \
-            --kernel kernel/out/arch/arm64/boot/Image \
-            --header_version 3 \
-            --os_version 16.0.0 \
-            --os_patch_level 2025-06 \
-            -o boot.img
-          ls -la boot.img
-
       - name: Package AnyKernel3 zip
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
@@ -331,10 +320,24 @@ jobs:
 
           BLOCK=boot;
           IS_SLOT_DEVICE=auto;
-          RAMDISK_COMPRESSION=auto;
+          RAMDISK_COMPRESSION=none;
           PATCH_VBMETA_FLAG=auto;
+          NO_MAGISK_CHECK=1;
 
           . tools/ak3-core.sh;
+
+          # The stock boot ramdisk is lz4_legacy and magiskboot's decompression
+          # of it aborts ("Splitting image failed"). Only the kernel is replaced,
+          # so keep the ramdisk bytes untouched: unpack with -n (no decompress);
+          # RAMDISK_COMPRESSION=none above makes repack use -n as well.
+          magiskboot() {
+            if [ "$1" = unpack ]; then
+              shift;
+              "$BIN/magiskboot" unpack -n "$@";
+            else
+              "$BIN/magiskboot" "$@";
+            fi;
+          }
 
           split_boot;
           flash_boot;
@@ -367,7 +370,6 @@ jobs:
         with:
           name: lunaa-kernel
           path: |
-            boot.img
             lunaa-kernel-*.zip
 
       - name: Upload config, release string and modules
