@@ -13,6 +13,9 @@ name: Build kernel (lunaa)
 #
 # ksu_source=latest replaces ONLY drivers/kernelsu with the newest KernelSU Next
 # that supports 5.4 + SUSFS and ports the one hook the old tree needs.
+# ksu_source=official-tag uses the official KernelSU-Next/KernelSU-Next repo at
+# the tag given in ksu_tag (default v3.4.2). Like official-legacy it has NO SUSFS
+# glue, so the built-in SUSFS core is kept (SUSFS hiding will not work).
 # ksu_source=official-legacy uses KernelSU-Next/KernelSU-Next branch 'legacy'
 # (newest, includes fixes ported from 3.4.x) but it has NO SUSFS support.
 # susfs_source=latest replaces ONLY the SUSFS core of the tree (fs/susfs.c and
@@ -49,14 +52,19 @@ on:
         required: true
         default: true
       ksu_source:
-        description: "latest = KernelSU Next from ksu_repo/ksu_branch with SUSFS (auto-falls back to the built-in one if it does not build); official-legacy = newest official KernelSU-Next 'legacy' branch, NO SUSFS glue (SUSFS hiding will not work); builtin = version already in the kernel tree"
+        description: "official-tag = official KernelSU-Next at the tag in ksu_tag (e.g. v3.4.2), NO SUSFS glue; latest = KernelSU Next from ksu_repo/ksu_branch with SUSFS (auto-falls back to the built-in one if it does not build); official-legacy = newest official KernelSU-Next 'legacy' branch, NO SUSFS glue (SUSFS hiding will not work); builtin = version already in the kernel tree"
         type: choice
         required: true
-        default: "latest"
+        default: "official-tag"
         options:
+          - official-tag
           - latest
           - official-legacy
           - builtin
+      ksu_tag:
+        description: "Tag for ksu_source=official-tag (KernelSU-Next/KernelSU-Next)"
+        required: false
+        default: "v3.4.2"
       ksu_repo:
         description: "Repo for 'latest' (newest KernelSU Next for non-GKI 5.4 with SUSFS support)"
         required: true
@@ -185,8 +193,8 @@ jobs:
             grep -n "define SUSFS_VERSION" include/linux/susfs.h || true
           }
 
-          if [ "$KSU_SOURCE" = "official-legacy" ]; then
-            echo "official-legacy KernelSU has no SUSFS glue - keeping the built-in SUSFS"
+          if [ "$KSU_SOURCE" = "official-legacy" ] || [ "$KSU_SOURCE" = "official-tag" ]; then
+            echo "official KernelSU-Next has no SUSFS glue - keeping the built-in SUSFS"
             SUSFS_SOURCE=builtin
           fi
 
@@ -209,11 +217,17 @@ jobs:
           KSU_SOURCE: ${{ inputs.ksu_source }}
           KSU_REPO: ${{ inputs.ksu_repo }}
           KSU_BRANCH: ${{ inputs.ksu_branch }}
+          KSU_TAG: ${{ inputs.ksu_tag }}
         run: |
           set -uo pipefail
           exec > >(tee -a "$GITHUB_WORKSPACE/build.log") 2>&1
 
-          if [ "$KSU_SOURCE" = "official-legacy" ]; then
+          if [ "$KSU_SOURCE" = "official-tag" ]; then
+            KSU_REPO="KernelSU-Next/KernelSU-Next"
+            KSU_BRANCH="${KSU_TAG:-v3.4.2}"   # git clone -b accepts tags too
+            KSU_SOURCE="latest"
+            echo "::warning::official-tag selected ($KSU_BRANCH): official KernelSU-Next has no SUSFS support"
+          elif [ "$KSU_SOURCE" = "official-legacy" ]; then
             KSU_REPO="KernelSU-Next/KernelSU-Next"
             KSU_BRANCH="legacy"
             KSU_SOURCE="latest"
