@@ -12,8 +12,13 @@ name: Build kernel (lunaa)
 # failures). The only thing needed for kernel 5.4 is the pgtable.h fix below.
 #
 # ksu_source=latest replaces ONLY drivers/kernelsu with the newest KernelSU Next
-# that supports 5.4 + SUSFS and ports the one hook the old tree needs. If that
-# does not compile/link, the workflow restores the built-in version and rebuilds.
+# that supports 5.4 + SUSFS and ports the one hook the old tree needs.
+# ksu_source=official-legacy uses KernelSU-Next/KernelSU-Next branch 'legacy'
+# (newest, includes fixes ported from 3.4.x) but it has NO SUSFS support.
+# susfs_source=latest replaces ONLY the SUSFS core of the tree (fs/susfs.c and
+# include/linux/susfs*.h) with the newest SUSFS from susfs_repo/susfs_branch;
+# the hooks already present in fs/* stay as they are.
+# Fallback chain if the build fails: 1) built-in SUSFS, 2) built-in KernelSU.
 
 on:
   workflow_dispatch:
@@ -44,12 +49,13 @@ on:
         required: true
         default: true
       ksu_source:
-        description: "latest = newest KernelSU Next (auto-falls back to the built-in one if it does not build), builtin = version already in the kernel tree"
+        description: "latest = KernelSU Next from ksu_repo/ksu_branch with SUSFS (auto-falls back to the built-in one if it does not build); official-legacy = newest official KernelSU-Next 'legacy' branch, NO SUSFS glue (SUSFS hiding will not work); builtin = version already in the kernel tree"
         type: choice
         required: true
         default: "latest"
         options:
           - latest
+          - official-legacy
           - builtin
       ksu_repo:
         description: "Repo for 'latest' (newest KernelSU Next for non-GKI 5.4 with SUSFS support)"
@@ -59,6 +65,22 @@ on:
         description: "Branch for 'latest'"
         required: true
         default: "legacy-susfs-v2"
+      susfs_source:
+        description: "latest = newest SUSFS core from susfs_repo (auto-falls back to the built-in one if it does not build), builtin = SUSFS already in the kernel tree"
+        type: choice
+        required: true
+        default: "latest"
+        options:
+          - latest
+          - builtin
+      susfs_repo:
+        description: "SUSFS git repo for 'latest' (must contain kernel_patches/fs/susfs.c and kernel_patches/include/linux/susfs.h)"
+        required: true
+        default: "https://gitlab.com/simonpunk/susfs4ksu.git"
+      susfs_branch:
+        description: "SUSFS branch for 'latest' (the one matching kernel 5.4)"
+        required: true
+        default: "kernel-5.4"
       clang_repo:
         description: "Clang toolchain git repo"
         required: true
@@ -117,6 +139,69 @@ jobs:
           printf '%s' "$SUFFIX" > .scmversion
           echo "scmversion: $SUFFIX"
 
+      - name: Prepare SUSFS
+        if: inputs.ksu
+        working-directory: kernel
+        env:
+          SUSFS_SOURCE: ${{ inputs.susfs_source }}
+          SUSFS_REPO: ${{ inputs.susfs_repo }}
+          SUSFS_BRANCH: ${{ inputs.susfs_branch }}
+          KSU_SOURCE: ${{ inputs.ksu_source }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -uo pipefail
+          exec > >(tee -a "$GITHUB_WORKSPACE/build.log") 2>&1
+
+          echo "== built-in SUSFS"
+          ls fs/susfs.c include/linux/susfs*.h
+          grep -n "define SUSFS_VERSION" include/linux/susfs.h || true
+
+          # keep the SUSFS core of the tree so the Build step can fall back to it
+          rm -rf "$GITHUB_WORKSPACE/susfs_builtin"
+          mkdir -p "$GITHUB_WORKSPACE/susfs_builtin/fs" "$GITHUB_WORKSPACE/susfs_builtin/include/linux"
+          cp -a fs/susfs.c "$GITHUB_WORKSPACE/susfs_builtin/fs/"
+          cp -a include/linux/susfs*.h "$GITHUB_WORKSPACE/susfs_builtin/include/linux/"
+
+          cat > "$GITHUB_WORKSPACE/restore_susfs.sh" <<'EOS'
+          set -e
+          cd "$GITHUB_WORKSPACE/kernel"
+          rm -f include/linux/susfs*.h
+          cp -a "$GITHUB_WORKSPACE/susfs_builtin/fs/susfs.c" fs/susfs.c
+          cp -a "$GITHUB_WORKSPACE/susfs_builtin/include/linux/." include/linux/
+          EOS
+
+          try_latest_susfs() {
+            rm -rf "$GITHUB_WORKSPACE/susfs_latest"
+            git clone --depth=1 -b "$SUSFS_BRANCH" "$SUSFS_REPO" "$GITHUB_WORKSPACE/susfs_latest" || return 1
+            P="$GITHUB_WORKSPACE/susfs_latest/kernel_patches"
+            if [ ! -f "$P/fs/susfs.c" ] || [ ! -f "$P/include/linux/susfs.h" ]; then
+              echo "unexpected SUSFS repo layout"
+              return 1
+            fi
+            cp -a "$P/fs/susfs.c" fs/susfs.c
+            rm -f include/linux/susfs*.h
+            cp -a "$P"/include/linux/susfs*.h include/linux/
+            git -C "$GITHUB_WORKSPACE/susfs_latest" log -1 --format='SUSFS commit: %h %ad %s' --date=short
+            grep -n "define SUSFS_VERSION" include/linux/susfs.h || true
+          }
+
+          if [ "$KSU_SOURCE" = "official-legacy" ]; then
+            echo "official-legacy KernelSU has no SUSFS glue - keeping the built-in SUSFS"
+            SUSFS_SOURCE=builtin
+          fi
+
+          SUSFS_USED=builtin
+          if [ "$SUSFS_SOURCE" = "latest" ]; then
+            if try_latest_susfs; then
+              SUSFS_USED=latest
+            else
+              echo "::warning::Could not set up the latest SUSFS - using the built-in version"
+              bash "$GITHUB_WORKSPACE/restore_susfs.sh"
+            fi
+          fi
+          echo "SUSFS_USED=$SUSFS_USED" >> "$GITHUB_ENV"
+          echo "SUSFS source in use: $SUSFS_USED"
+
       - name: Prepare KernelSU Next
         if: inputs.ksu
         working-directory: kernel
@@ -127,6 +212,13 @@ jobs:
         run: |
           set -uo pipefail
           exec > >(tee -a "$GITHUB_WORKSPACE/build.log") 2>&1
+
+          if [ "$KSU_SOURCE" = "official-legacy" ]; then
+            KSU_REPO="KernelSU-Next/KernelSU-Next"
+            KSU_BRANCH="legacy"
+            KSU_SOURCE="latest"
+            echo "::warning::official-legacy selected: this KernelSU Next has no SUSFS support"
+          fi
 
           echo "== built-in KernelSU / SUSFS"
           ls -d drivers/kernelsu fs/susfs.c include/linux/susfs.h
@@ -246,10 +338,17 @@ jobs:
             scripts/config --file out/.config -d KSU
             $MK olddefconfig
           elif [ "${KSU_USED:-builtin}" = "latest" ]; then
+            $MK olddefconfig
+            cp out/.config out/.config.latest
             # the newest KernelSU expects the SUSFS 2.0 try_umount / memfd API,
-            # the SUSFS v2.1.0 in this tree does not provide it
+            # the SUSFS v2.1.0 in this tree does not provide it: .config.compat is
+            # the config for latest KernelSU + built-in SUSFS
             scripts/config --file out/.config -d KSU_SUSFS_TRY_UMOUNT -d KSU_SUSFS_SUS_MEMFD
             $MK olddefconfig
+            cp out/.config out/.config.compat
+            if [ "${SUSFS_USED:-builtin}" = "latest" ]; then
+              cp out/.config.latest out/.config
+            fi
           fi
 
           echo "--- resulting KernelSU / SUSFS config"
@@ -270,20 +369,36 @@ jobs:
           set -o pipefail
           build() { $MK -j"$(nproc)" Image modules 2>&1 | tee -a ../build.log; }
 
-          FAILED=0
-          if ! build; then
+          OK=0
+          build && OK=1
+
+          if [ "$OK" = "0" ] && [ "${SUSFS_USED:-builtin}" = "latest" ]; then
+            echo "::warning::Build failed with the latest SUSFS - falling back to the built-in SUSFS"
+            grep -nE "error:|\*\*\*|undefined reference" ../build.log | head -15 || true
+            bash "$GITHUB_WORKSPACE/restore_susfs.sh"
             if [ "${KSU_USED:-builtin}" = "latest" ]; then
-              echo "::warning::Build failed with the latest KernelSU Next - falling back to the built-in version"
-              grep -nE "error:|\*\*\*|undefined reference" ../build.log | head -15 || true
-              bash "$GITHUB_WORKSPACE/restore_builtin.sh"
-              cp out/.config.builtin out/.config
-              $MK olddefconfig
-              echo "KSU_USED=builtin" >> "$GITHUB_ENV"
-              build || FAILED=1
+              cp out/.config.compat out/.config
             else
-              FAILED=1
+              cp out/.config.builtin out/.config
             fi
+            $MK olddefconfig
+            SUSFS_USED=builtin
+            echo "SUSFS_USED=builtin" >> "$GITHUB_ENV"
+            build && OK=1
           fi
+
+          if [ "$OK" = "0" ] && [ "${KSU_USED:-builtin}" = "latest" ]; then
+            echo "::warning::Build failed with the latest KernelSU Next - falling back to the built-in version"
+            grep -nE "error:|\*\*\*|undefined reference" ../build.log | head -15 || true
+            bash "$GITHUB_WORKSPACE/restore_builtin.sh"
+            cp out/.config.builtin out/.config
+            $MK olddefconfig
+            echo "KSU_USED=builtin" >> "$GITHUB_ENV"
+            build && OK=1
+          fi
+
+          FAILED=0
+          [ "$OK" = "1" ] || FAILED=1
 
           if [ "$FAILED" = "1" ]; then
             echo "::group::First errors"
@@ -362,6 +477,7 @@ jobs:
             echo "### Build summary"
             echo "- Kernel release: \`$(cat kernel/out/include/config/kernel.release 2>/dev/null || echo n/a)\`"
             echo "- KernelSU source: ${KSU_USED:-none} ($(git -C kernel/KernelSU-Next log -1 --format='%h %ad' --date=short 2>/dev/null || echo 'built-in'))"
+            echo "- SUSFS source: ${SUSFS_USED:-none} ($(grep -h '#define SUSFS_VERSION' kernel/include/linux/susfs.h 2>/dev/null || echo 'n/a'))"
             grep -E "^CONFIG_KSU" kernel/out/.config 2>/dev/null | sed 's/^/    /' || true
           } >> "$GITHUB_STEP_SUMMARY"
 
