@@ -268,6 +268,65 @@ jobs:
             ln -sfn ../KernelSU-Next/kernel drivers/kernelsu
             fix_pgtable KernelSU-Next/kernel
 
+            # ---- kernel 5.4 compatibility for the newest official KernelSU-Next (v3.x) ----
+            # 1) seccomp_cache.c mirrors the seccomp ACTION CACHE of Linux 5.11+
+            #    (SECCOMP_ARCH_NATIVE_NR, struct action_cache). This 5.4 tree has no such
+            #    cache, so there is nothing to clear or allow: make both helpers no-ops.
+            if [ -f KernelSU-Next/kernel/infra/seccomp_cache.c ] \
+               && ! grep -q "KERNEL_VERSION(5, 10, 0)" KernelSU-Next/kernel/infra/seccomp_cache.c \
+               && ! grep -rqsE "define[[:space:]]+SECCOMP_ARCH_NATIVE_NR" include arch/arm64/include; then
+          cat > KernelSU-Next/kernel/infra/seccomp_cache.c <<'EOS'
+          #include <linux/types.h>
+          #include <linux/seccomp.h>
+          #include "infra/seccomp_cache.h"
+
+          /* kernel without seccomp action cache (< 5.11): nothing to do */
+          void ksu_seccomp_clear_cache(struct seccomp_filter *filter, int nr)
+          {
+          }
+
+          void ksu_seccomp_allow_cache(struct seccomp_filter *filter, int nr)
+          {
+          }
+          EOS
+              echo "seccomp_cache.c replaced by a no-op (no seccomp action cache in this kernel)"
+            fi
+
+            # 2) This tree has manual hooks in fs/read_write.c and drivers/tty/pty.c that are
+            #    guarded by plain CONFIG_KSU (the SUSFS hooks are compiled out, because only the
+            #    built-in Kconfig defines CONFIG_KSU_SUSFS). The official KernelSU-Next (legacy
+            #    and v3.x) does not provide these symbols -> "undefined symbol:
+            #    ksu_init_rc_hook_key_false / ksu_handle_devpts" at link time. Provide inert stubs
+            #    for exactly the symbols the source is missing: the static key stays off, so the
+            #    read(2) hook is never taken, and devpts is handled by KernelSU's own LSM hook.
+            SYSCALL_GEN=0
+            [ -f KernelSU-Next/kernel/hook/syscall_hook_manager.c ] && SYSCALL_GEN=1
+            SHIM=KernelSU-Next/kernel/infra/legacy_hook_shim.c
+            printf '%s\n' '#include <linux/fs.h>' '#include <linux/jump_label.h>' '#include <linux/compiler.h>' > "$SHIM"
+            NEED_SHIM=0
+            if ! grep -rq "ksu_init_rc_hook_key_false" KernelSU-Next/kernel --include=*.c --include=*.h; then
+              NEED_SHIM=1
+              printf '%s\n' '' '/* referenced by fs/read_write.c of this tree; never enabled */' \
+                'DEFINE_STATIC_KEY_FALSE(ksu_init_rc_hook_key_false);' >> "$SHIM"
+              # the key guards a call to ksu_handle_sys_read(); make sure it exists
+              if ! grep -rqE "^(int|void) ksu_handle_sys_read" KernelSU-Next/kernel --include=*.c; then
+                printf '%s\n' '' '__attribute__((cold)) int ksu_handle_sys_read(unsigned int fd)' '{' '	return 0;' '}' >> "$SHIM"
+              fi
+            fi
+            if ! grep -rq "ksu_handle_devpts" KernelSU-Next/kernel --include=*.c --include=*.h \
+               || [ "$(grep -rh "ksu_handle_devpts" KernelSU-Next/kernel --include=*.c | grep -vc '^[[:space:]]*//')" = "0" ]; then
+              NEED_SHIM=1
+              printf '%s\n' '' '/* called from drivers/tty/pty.c of this tree */' \
+                'int ksu_handle_devpts(struct inode *inode)' '{' '	return 0;' '}' >> "$SHIM"
+            fi
+            if [ "$NEED_SHIM" = "1" ]; then
+              sed -i 's|^kernelsu-objs += infra/seccomp_cache.o$|&\nkernelsu-objs += infra/legacy_hook_shim.o|' KernelSU-Next/kernel/Kbuild
+              grep -q "legacy_hook_shim.o" KernelSU-Next/kernel/Kbuild || { echo "legacy_hook_shim Kbuild patch failed"; return 1; }
+              echo "legacy hook shim added:"; cat "$SHIM"
+            else
+              rm -f "$SHIM"
+            fi
+
             # The newest KernelSU schedules 'susfs_extra_works', a work_struct that only
             # exists in SUSFS 2.0 (link error: undefined symbol susfs_extra_works).
             # SUSFS 2.1.0 in this tree exposes the same job as susfs_run_sus_path_loop(),
@@ -298,7 +357,7 @@ jobs:
             # fs/stat.c of this tree calls ksu_handle_vfs_fstat() (adjusts init.rc size
             # so the injected ksud rc is read completely). Newer KernelSU dropped it,
             # so port the function from the built-in version instead of stubbing it.
-            if ! grep -rq "ksu_handle_vfs_fstat" KernelSU-Next/kernel; then
+            if [ "$SYSCALL_GEN" = "0" ] && ! grep -rq "ksu_handle_vfs_fstat" KernelSU-Next/kernel; then
               awk '/^void ksu_handle_vfs_fstat/{p=1} p{print} p&&/^}/{exit}' \
                 "$GITHUB_WORKSPACE/ksu_builtin/runtime/ksud_integration.c" > "$GITHUB_WORKSPACE/vfs_fstat.c"
               [ -s "$GITHUB_WORKSPACE/vfs_fstat.c" ] || { echo "could not extract ksu_handle_vfs_fstat"; return 1; }
@@ -337,22 +396,51 @@ jobs:
           DEFCONFIG: ${{ inputs.defconfig }}
           EXTRA_CONFIGS: ${{ inputs.extra_configs }}
           WANT_KSU: ${{ inputs.ksu }}
+          KSU_SOURCE: ${{ inputs.ksu_source }}
         run: |
           export ARCH=arm64 SUBARCH=arm64
           MK="make O=out CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
 
-          $MK "$DEFCONFIG"
-          for frag in $EXTRA_CONFIGS; do
-            $MK "$frag"
-          done
-          # config exactly as the tree defines it; used if we have to fall back
-          cp out/.config out/.config.builtin
+          gen_defconfig() {
+            $MK "$DEFCONFIG"
+            for frag in $EXTRA_CONFIGS; do
+              $MK "$frag"
+            done
+          }
+
+          # .config.builtin (used if we have to fall back) must be generated against the
+          # BUILT-IN Kconfig. With another KernelSU linked into drivers/kernelsu its Kconfig
+          # does not know KSU_MANUAL_HOOK / KSU_SUSFS*, so those lines would be dropped and
+          # the built-in code would later be built in the wrong hook mode (Kprobes ->
+          # "use of undeclared identifier 'ksu_vfs_read_hook'").
+          if [ "${KSU_USED:-builtin}" != "builtin" ]; then
+            rm -rf drivers/.ksu_cur
+            mv drivers/kernelsu drivers/.ksu_cur
+            cp -a "$GITHUB_WORKSPACE/ksu_builtin" drivers/kernelsu
+            gen_defconfig
+            cp out/.config out/.config.builtin
+            rm -rf drivers/kernelsu
+            mv drivers/.ksu_cur drivers/kernelsu
+          fi
+          gen_defconfig
+          [ -f out/.config.builtin ] || cp out/.config out/.config.builtin
 
           if [ "$WANT_KSU" != "true" ]; then
             scripts/config --file out/.config -d KSU
             $MK olddefconfig
           elif [ "${KSU_USED:-builtin}" = "latest" ]; then
+            if [ "$KSU_SOURCE" = "official-legacy" ]; then
+              # Manual hook mode would need the SUSFS-guarded hooks of this tree (execveat,
+              # faccessat, stat, reboot, input ...), which are compiled out without
+              # CONFIG_KSU_SUSFS -> it links but root would not work. The official legacy branch
+              # has a syscall-table hook mode for non-GKI kernels that needs no tree hooks.
+              scripts/config --file out/.config -d KSU_MANUAL_HOOK -d KSU_KPROBES_HOOK -e KSU_SYSCALL_TABLE_HOOK
+            fi
             $MK olddefconfig
+            if [ "$KSU_SOURCE" = "official-legacy" ]; then
+              grep -q '^CONFIG_KSU_SYSCALL_TABLE_HOOK=y' out/.config \
+                || echo "::warning::KSU_SYSCALL_TABLE_HOOK did not stick - official-legacy would be built in manual hook mode (no working root)"
+            fi
             cp out/.config out/.config.latest
             # the newest KernelSU expects the SUSFS 2.0 try_umount / memfd API,
             # the SUSFS v2.1.0 in this tree does not provide it: .config.compat is
