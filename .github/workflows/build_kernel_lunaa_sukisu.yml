@@ -285,6 +285,12 @@ jobs:
             ln -sfn ../KernelSU-Next/kernel drivers/kernelsu
             fix_pgtable KernelSU-Next/kernel
 
+            # SukiSU includes <linux/static_call.h> (kernel 5.10+) but does not use it
+            if [ "$KSU_FLAVOR" = "sukisu" ] && [ ! -f include/linux/static_call.h ]; then
+              sed -i '/<linux\/static_call.h>/d' KernelSU-Next/kernel/kernel_includes.h
+              echo "static_call.h include removed (not present in this kernel)"
+            fi
+
             # The newest KernelSU schedules 'susfs_extra_works', a work_struct that only
             # exists in SUSFS 2.0 (link error: undefined symbol susfs_extra_works).
             # SUSFS 2.1.0 in this tree exposes the same job as susfs_run_sus_path_loop(),
@@ -358,17 +364,29 @@ jobs:
           export ARCH=arm64 SUBARCH=arm64
           MK="make O=out CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
 
+          # The config the tree defines must be generated with the BUILT-IN KernelSU
+          # Kconfig. With another KernelSU linked in, defconfig silently drops symbols it
+          # does not know (e.g. KSU_MANUAL_HOOK) and the fallback build would fail.
+          if [ "${KSU_USED:-builtin}" = "latest" ]; then
+            rm -f drivers/kernelsu
+            cp -a "$GITHUB_WORKSPACE/ksu_builtin" drivers/kernelsu
+          fi
           $MK "$DEFCONFIG"
           for frag in $EXTRA_CONFIGS; do
             $MK "$frag"
           done
           # config exactly as the tree defines it; used if we have to fall back
           cp out/.config out/.config.builtin
+          if [ "${KSU_USED:-builtin}" = "latest" ]; then
+            rm -rf drivers/kernelsu
+            ln -sfn ../KernelSU-Next/kernel drivers/kernelsu
+          fi
 
           if [ "$WANT_KSU" != "true" ]; then
             scripts/config --file out/.config -d KSU
             $MK olddefconfig
           elif [ "${KSU_USED:-builtin}" = "latest" ]; then
+            cp out/.config.builtin out/.config
             $MK olddefconfig
             cp out/.config out/.config.latest
             # the newest KernelSU expects the SUSFS 2.0 try_umount / memfd API,
