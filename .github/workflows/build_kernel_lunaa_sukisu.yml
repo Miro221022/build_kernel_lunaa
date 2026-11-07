@@ -20,7 +20,8 @@ name: Build kernel (lunaa)
 # susfs_source=latest replaces ONLY the SUSFS core of the tree (fs/susfs.c and
 # include/linux/susfs*.h) with the newest SUSFS from susfs_repo/susfs_branch;
 # the hooks already present in fs/* stay as they are.
-# Fallback chain if the build fails: 1) built-in SUSFS, 2) built-in KernelSU.
+# If allow_fallback=true and the build fails: 1) built-in SUSFS, 2) built-in KernelSU.
+# With allow_fallback=false (default) the build simply fails and shows the errors.
 
 on:
   workflow_dispatch:
@@ -51,7 +52,7 @@ on:
         required: true
         default: true
       ksu_source:
-        description: "latest = KernelSU Next from ksu_repo/ksu_branch with SUSFS (auto-falls back to the built-in one if it does not build); official-legacy = newest official KernelSU-Next 'legacy' branch, NO SUSFS glue (SUSFS hiding will not work); sukisu = SukiSU Ultra 'builtin' branch (experimental on 5.4, uses the SUSFS in the tree, auto-falls back); builtin = version already in the kernel tree"
+        description: "latest = KernelSU Next from ksu_repo/ksu_branch with SUSFS (falls back to the built-in only if allow_fallback=true); official-legacy = newest official KernelSU-Next 'legacy' branch, NO SUSFS glue (SUSFS hiding will not work); sukisu = SukiSU Ultra 'builtin' branch (experimental on 5.4, uses the SUSFS in the tree; with allow_fallback=false a failed build is NOT replaced by another KernelSU); builtin = version already in the kernel tree"
         type: choice
         required: true
         default: "latest"
@@ -69,7 +70,7 @@ on:
         required: true
         default: "legacy-susfs-v2"
       susfs_source:
-        description: "latest = newest SUSFS core from susfs_repo (auto-falls back to the built-in one if it does not build), builtin = SUSFS already in the kernel tree"
+        description: "latest = newest SUSFS core from susfs_repo (falls back to the built-in only if allow_fallback=true), builtin = SUSFS already in the kernel tree"
         type: choice
         required: true
         default: "latest"
@@ -84,6 +85,11 @@ on:
         description: "SUSFS branch for 'latest' (the one matching kernel 5.4)"
         required: true
         default: "kernel-5.4"
+      allow_fallback:
+        description: "true = if the build fails with the chosen KernelSU/SUSFS, silently rebuild with the built-in ones. false (default) = the build FAILS so you see the real errors and never get a different KernelSU than you chose"
+        type: boolean
+        required: true
+        default: false
       clang_repo:
         description: "Clang toolchain git repo"
         required: true
@@ -222,6 +228,7 @@ jobs:
         if: inputs.ksu
         working-directory: kernel
         env:
+          ALLOW_FALLBACK: ${{ inputs.allow_fallback }}
           KSU_SOURCE: ${{ inputs.ksu_source }}
           KSU_REPO: ${{ inputs.ksu_repo }}
           KSU_BRANCH: ${{ inputs.ksu_branch }}
@@ -291,6 +298,33 @@ jobs:
               echo "static_call.h include removed (not present in this kernel)"
             fi
 
+            # SukiSU 5.4 compatibility (kernel 5.4 + SUSFS v2.1.0 in the tree)
+            if [ "$KSU_FLAVOR" = "sukisu" ]; then
+              SK=KernelSU-Next/kernel
+              # clocksource::vdso_clock_mode only exists since 5.10
+              perl -0pi -e 's/(\n[ \t]*)\(\*curr_cs_ptr\)->vdso_clock_mode =\s*VDSO_CLOCKMODE_ARCHTIMER;/\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)$1(*curr_cs_ptr)->vdso_clock_mode = VDSO_CLOCKMODE_ARCHTIMER;\n#endif/' "$SK/extension/cpu_spoof.c"
+              # struct selinux_policy variables are unused on < 5.10 (-Werror)
+              sed -i 's/struct selinux_policy \*pol, \*old_pol;/struct selinux_policy *pol __maybe_unused, *old_pol __maybe_unused;/' "$SK/selinux/rules.c"
+              # SUSFS 2.2+ helpers that the SUSFS in the tree does not have: no-op shims
+              if ! grep -qs susfs_set_current_proc_no_su include/linux/susfs.h include/linux/susfs_def.h; then
+                cat > "$SK/susfs_compat.h" <<'EOS'
+          /* Shims for SUSFS 2.2+ helpers when the tree only has an older SUSFS core. */
+          #ifndef KSU_SUSFS_COMPAT_H
+          #define KSU_SUSFS_COMPAT_H
+          #ifndef CMD_SUSFS_SET_PRIORITY_UID_FILTER
+          #define CMD_SUSFS_SET_PRIORITY_UID_FILTER 0x555ff
+          #endif
+          static inline void susfs_set_current_proc_no_su(void) {}
+          static inline void susfs_set_current_proc_umounted_for_zygote_next(void) {}
+          static inline void susfs_parse_priority_app_strings(void) {}
+          static inline int susfs_set_priority_uid_filter(void __user *user_info) { return 0; }
+          #endif
+          EOS
+                sed -i 's|^#include <linux/susfs_def.h>|&\n#include "susfs_compat.h"|' "$SK/kernel_includes.h"
+                echo "SukiSU: SUSFS 2.2 compat shims installed (no-op)"
+              fi
+            fi
+
             # The newest KernelSU schedules 'susfs_extra_works', a work_struct that only
             # exists in SUSFS 2.0 (link error: undefined symbol susfs_extra_works).
             # SUSFS 2.1.0 in this tree exposes the same job as susfs_run_sus_path_loop(),
@@ -341,6 +375,10 @@ jobs:
             if try_latest; then
               KSU_USED=latest
             else
+              if [ "$ALLOW_FALLBACK" != "true" ]; then
+                echo "::error::Could not set up the selected KernelSU source ($KSU_REPO @ $KSU_BRANCH) and allow_fallback is off"
+                exit 1
+              fi
               echo "::warning::Could not set up the latest KernelSU Next - using the built-in version"
               bash "$GITHUB_WORKSPACE/restore_builtin.sh"
             fi
@@ -410,6 +448,8 @@ jobs:
 
       - name: Build
         working-directory: kernel
+        env:
+          ALLOW_FALLBACK: ${{ inputs.allow_fallback }}
         run: |
           export ARCH=arm64 SUBARCH=arm64
           MK="make O=out CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
@@ -421,7 +461,7 @@ jobs:
           OK=0
           build && OK=1
 
-          if [ "$OK" = "0" ] && [ "${SUSFS_USED:-builtin}" = "latest" ]; then
+          if [ "$OK" = "0" ] && [ "$ALLOW_FALLBACK" = "true" ] && [ "${SUSFS_USED:-builtin}" = "latest" ]; then
             echo "::warning::Build failed with the latest SUSFS - falling back to the built-in SUSFS"
             grep -nE "error:|\*\*\*|undefined reference" ../build.log | head -15 || true
             bash "$GITHUB_WORKSPACE/restore_susfs.sh"
@@ -436,7 +476,7 @@ jobs:
             build && OK=1
           fi
 
-          if [ "$OK" = "0" ] && [ "${KSU_USED:-builtin}" = "latest" ]; then
+          if [ "$OK" = "0" ] && [ "$ALLOW_FALLBACK" = "true" ] && [ "${KSU_USED:-builtin}" = "latest" ]; then
             echo "::warning::Build failed with the latest KernelSU Next - falling back to the built-in version"
             grep -nE "error:|\*\*\*|undefined reference" ../build.log | head -15 || true
             bash "$GITHUB_WORKSPACE/restore_builtin.sh"
@@ -451,7 +491,7 @@ jobs:
 
           if [ "$FAILED" = "1" ]; then
             echo "::group::First errors"
-            grep -nE "error:|\*\*\*|undefined reference" ../build.log | head -20 || true
+            grep -nE "error:|\*\*\*|undefined reference" ../build.log | head -60 || true
             echo "::endgroup::"
             echo "::group::Single-threaded re-run for a readable error"
             $MK -j1 Image 2>&1 | tail -n 40 || true
