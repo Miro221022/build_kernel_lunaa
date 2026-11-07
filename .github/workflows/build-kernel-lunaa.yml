@@ -302,6 +302,20 @@ jobs:
               echo "patch_memory.c: compat copy_to_kernel_nofault macro disabled (kernel has it)"
             fi
 
+            # 4) hook/patch_memory.c walks the kernel page tables with pmd_leaf()/pud_leaf(),
+            #    which only exist since Linux 5.8. On 5.4 arm64 the kernel image is mapped with
+            #    2 MB sections, pmd_bad() is true for them and the walk fails with
+            #    "failed to find phy addr for patch dst addr" -> "sth: 0/4 syscalls hooked".
+            #    5.4 names these helpers pmd_sect()/pud_sect(): map the new names onto them.
+            if [ -f KernelSU-Next/kernel/hook/patch_memory.c ] \
+               && ! grep -rqsE "define[[:space:]]+pmd_leaf" include arch/arm64/include \
+               && grep -qE "define[[:space:]]+pmd_sect" arch/arm64/include/asm/pgtable.h; then
+              sed -i '0,/^#include <linux\/version.h>$/s//&\n#include <asm\/pgtable.h>\n#if !defined(pmd_leaf) \&\& defined(pmd_sect)\n#define pmd_leaf(pmd) pmd_sect(pmd)\n#endif\n#if !defined(pud_leaf) \&\& defined(pud_sect)\n#define pud_leaf(pud) pud_sect(pud)\n#endif/' KernelSU-Next/kernel/hook/patch_memory.c
+              grep -q "define pmd_leaf(pmd) pmd_sect(pmd)" KernelSU-Next/kernel/hook/patch_memory.c \
+                || { echo "patch_memory.c pmd_leaf compat patch failed"; return 1; }
+              echo "patch_memory.c: pmd_leaf/pud_leaf compat added (5.4 section mappings)"
+            fi
+
             # 2) This tree has manual hooks in fs/read_write.c and drivers/tty/pty.c that are
             #    guarded by plain CONFIG_KSU (the SUSFS hooks are compiled out, because only the
             #    built-in Kconfig defines CONFIG_KSU_SUSFS). The official KernelSU-Next (legacy
@@ -407,9 +421,15 @@ jobs:
           EXTRA_CONFIGS: ${{ inputs.extra_configs }}
           WANT_KSU: ${{ inputs.ksu }}
           KSU_SOURCE: ${{ inputs.ksu_source }}
+          KSU_TAG: ${{ inputs.ksu_tag }}
         run: |
           export ARCH=arm64 SUBARCH=arm64
           MK="make O=out CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+
+          # official legacy line: the 'legacy' branch or a '*-legacy' tag
+          LEGACY_KSU=0
+          [ "$KSU_SOURCE" = "official-legacy" ] && LEGACY_KSU=1
+          case "$KSU_SOURCE:$KSU_TAG" in official-tag:*legacy*) LEGACY_KSU=1 ;; esac
 
           gen_defconfig() {
             $MK "$DEFCONFIG"
@@ -439,7 +459,7 @@ jobs:
             scripts/config --file out/.config -d KSU
             $MK olddefconfig
           elif [ "${KSU_USED:-builtin}" = "latest" ]; then
-            if [ "$KSU_SOURCE" = "official-legacy" ]; then
+            if [ "$LEGACY_KSU" = "1" ]; then
               # Manual hook mode would need the SUSFS-guarded hooks of this tree (execveat,
               # faccessat, stat, reboot, input ...), which are compiled out without
               # CONFIG_KSU_SUSFS -> it links but root would not work. The official legacy branch
@@ -447,7 +467,7 @@ jobs:
               scripts/config --file out/.config -d KSU_MANUAL_HOOK -d KSU_KPROBES_HOOK -e KSU_SYSCALL_TABLE_HOOK
             fi
             $MK olddefconfig
-            if [ "$KSU_SOURCE" = "official-legacy" ]; then
+            if [ "$LEGACY_KSU" = "1" ]; then
               grep -q '^CONFIG_KSU_SYSCALL_TABLE_HOOK=y' out/.config \
                 || echo "::warning::KSU_SYSCALL_TABLE_HOOK did not stick - official-legacy would be built in manual hook mode (no working root)"
             fi
