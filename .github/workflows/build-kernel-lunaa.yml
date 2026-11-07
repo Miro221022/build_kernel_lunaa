@@ -292,6 +292,16 @@ jobs:
               echo "seccomp_cache.c replaced by a no-op (no seccomp action cache in this kernel)"
             fi
 
+            # 3) hook/patch_memory.c (syscall-table hook mode) defines its own
+            #    copy_to_kernel_nofault() compat macro for kernels < 5.8. This tree already
+            #    backports the real function (include/linux/uaccess.h), so the macro mangles
+            #    that declaration ("declaration specifier missing" at uaccess.h:311).
+            if [ -f KernelSU-Next/kernel/hook/patch_memory.c ] \
+               && grep -q "copy_to_kernel_nofault" include/linux/uaccess.h; then
+              sed -i '/^#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)$/{N;/define copy_to_kernel_nofault/s/KERNEL_VERSION(5, 8, 0)/KERNEL_VERSION(0, 0, 0)/}' KernelSU-Next/kernel/hook/patch_memory.c
+              echo "patch_memory.c: compat copy_to_kernel_nofault macro disabled (kernel has it)"
+            fi
+
             # 2) This tree has manual hooks in fs/read_write.c and drivers/tty/pty.c that are
             #    guarded by plain CONFIG_KSU (the SUSFS hooks are compiled out, because only the
             #    built-in Kconfig defines CONFIG_KSU_SUSFS). The official KernelSU-Next (legacy
