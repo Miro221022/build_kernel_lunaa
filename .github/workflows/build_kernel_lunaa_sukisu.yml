@@ -318,6 +318,12 @@ jobs:
           static inline void susfs_set_current_proc_umounted_for_zygote_next(void) {}
           static inline void susfs_parse_priority_app_strings(void) {}
           static inline int susfs_set_priority_uid_filter(void __user *user_info) { return 0; }
+          /* link-time stubs: weak, so a real SUSFS 2.2+ implementation would win */
+          struct inode;
+          __weak int susfs_add_sus_type(const char *secctx, u32 type_value) { return 0; }
+          __weak int susfs_add_sus_avd_allowed_by_type(u32 s_type, u32 t_type, u16 type, u32 orig_avd_allowed) { return 0; }
+          /* called by the devpts/pty hooks already present in this tree */
+          __weak int ksu_handle_devpts(struct inode *inode) { return 0; }
           #endif
           EOS
                 sed -i 's|^#include <linux/susfs_def.h>|&\n#include "susfs_compat.h"|' "$SK/kernel_includes.h"
@@ -330,6 +336,7 @@ jobs:
             # SUSFS 2.1.0 in this tree exposes the same job as susfs_run_sus_path_loop(),
             # which is what the built-in KernelSU calls, so provide the work item here.
             SH=KernelSU-Next/kernel/hook/setuid_hook.c
+            [ "$KSU_FLAVOR" = "sukisu" ] && SH=KernelSU-Next/kernel/hook/lsm_hook.c
             if grep -q '^extern struct work_struct susfs_extra_works;' "$SH" \
                && ! grep -rq "susfs_extra_works" include/linux fs/susfs.c; then
           cat > "$GITHUB_WORKSPACE/susfs_extra_works_shim.c" <<'EOS'
