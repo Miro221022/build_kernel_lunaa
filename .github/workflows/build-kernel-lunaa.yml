@@ -349,19 +349,17 @@ jobs:
               MANUAL_GEN=0
               grep -q "KSU_MANUAL_HOOK" KernelSU-Next/kernel/Kconfig && MANUAL_GEN=1
               if [ "$MANUAL_GEN" = "1" ]; then
-                # manual-hook generation (official legacy): this tree's hooks drive ksud, so the
-                # keys must be ON (they are switched on once, before userspace starts)
+                # manual-hook generation (official legacy): this tree's hooks drive ksud. With
+                # CONFIG_KSU_SUSFS (added to the Kconfig below) fs/susfs.c of this tree already
+                # DEFINES both keys (off by default) -> only switch them on, once, before userspace
                 printf '%s\n' '' '#include <linux/init.h>' '' \
-                  '/* referenced by fs/read_write.c, drivers/input/input.c of this tree */' \
-                  'DEFINE_STATIC_KEY_FALSE(ksu_init_rc_hook_key_false);' >> "$SHIM"
-                if ! grep -rq "ksu_input_hook_key_false" KernelSU-Next/kernel --include=*.c --include=*.h; then
-                  printf '%s\n' 'DEFINE_STATIC_KEY_FALSE(ksu_input_hook_key_false);' >> "$SHIM"
-                  INPUT_KEY=1
-                fi
-                printf '%s\n' '' 'static int __init ksu_shim_enable_hooks(void)' '{' \
-                  '	static_branch_enable(&ksu_init_rc_hook_key_false);' >> "$SHIM"
-                [ "${INPUT_KEY:-0}" = "1" ] && printf '%s\n' '	static_branch_enable(&ksu_input_hook_key_false);' >> "$SHIM"
-                printf '%s\n' '	return 0;' '}' 'late_initcall(ksu_shim_enable_hooks);' >> "$SHIM"
+                  '/* defined in fs/susfs.c of this tree */' \
+                  'extern struct static_key_false ksu_init_rc_hook_key_false;' \
+                  'extern struct static_key_false ksu_input_hook_key_false;' '' \
+                  'static int __init ksu_shim_enable_hooks(void)' '{' \
+                  '	static_branch_enable(&ksu_init_rc_hook_key_false);' \
+                  '	static_branch_enable(&ksu_input_hook_key_false);' \
+                  '	return 0;' '}' 'late_initcall(ksu_shim_enable_hooks);' >> "$SHIM"
               else
                 printf '%s\n' '' '/* referenced by fs/read_write.c of this tree; never enabled */' \
                   'DEFINE_STATIC_KEY_FALSE(ksu_init_rc_hook_key_false);' >> "$SHIM"
