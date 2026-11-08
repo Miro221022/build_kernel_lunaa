@@ -360,6 +360,14 @@ jobs:
                   '	static_branch_enable(&ksu_init_rc_hook_key_false);' \
                   '	static_branch_enable(&ksu_input_hook_key_false);' \
                   '	return 0;' '}' 'late_initcall(ksu_shim_enable_hooks);' >> "$SHIM"
+                # SUSFS helpers that fs/namespace.c and security/selinux/avc.c of this tree call and
+                # that only a SUSFS-aware KernelSU provides. The official one has no SUSFS glue, so
+                # keep them inert: SIDs stay 0 and nothing is classed as the ksu domain.
+                if ! grep -rq "susfs_is_current_ksu_domain" KernelSU-Next/kernel --include=*.c --include=*.h; then
+                  printf '%s\n' '' '/* inert SUSFS helpers (no SUSFS glue in the official KernelSU-Next) */' \
+                    'u32 susfs_ksu_sid;' 'u32 susfs_priv_app_sid;' '' \
+                    'bool susfs_is_current_ksu_domain(void)' '{' '	return false;' '}' >> "$SHIM"
+                fi
               else
                 printf '%s\n' '' '/* referenced by fs/read_write.c of this tree; never enabled */' \
                   'DEFINE_STATIC_KEY_FALSE(ksu_init_rc_hook_key_false);' >> "$SHIM"
