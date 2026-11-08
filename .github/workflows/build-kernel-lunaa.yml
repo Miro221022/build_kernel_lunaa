@@ -302,6 +302,22 @@ jobs:
               echo "patch_memory.c: compat copy_to_kernel_nofault macro disabled (kernel has it)"
             fi
 
+            # 5) Manual-hook generation of the official KernelSU-Next (legacy branch): it already
+            #    exports every entry point this tree's hooks call (ksu_handle_execveat/_sucompat,
+            #    faccessat, stat, sys_read, sys_reboot, setresuid, input ...). But those hooks in
+            #    fs/*, kernel/*, drivers/input/* are compiled only with CONFIG_KSU_SUSFS, a symbol
+            #    that only the built-in Kconfig defines. Give the official Kconfig the same SUSFS
+            #    options (copied from the built-in one) so the hooks and the built-in SUSFS core
+            #    get built. (Table-hook mode was tried: it never reports boot events -> no manager.)
+            if grep -q "KSU_MANUAL_HOOK" KernelSU-Next/kernel/Kconfig \
+               && ! grep -q "config KSU_SUSFS" KernelSU-Next/kernel/Kconfig \
+               && [ -f "$GITHUB_WORKSPACE/ksu_builtin/Kconfig" ]; then
+              awk '/^menu "KernelSU - SUSFS"/{p=1} p{print} p&&/^endmenu/{exit}' "$GITHUB_WORKSPACE/ksu_builtin/Kconfig" > /tmp/susfs_kconfig.txt
+              grep -q "config KSU_SUSFS$" /tmp/susfs_kconfig.txt || { echo "could not extract SUSFS Kconfig block"; return 1; }
+              { echo; cat /tmp/susfs_kconfig.txt; } >> KernelSU-Next/kernel/Kconfig
+              echo "SUSFS Kconfig options added to the official KernelSU-Next Kconfig ($(grep -c '^config' /tmp/susfs_kconfig.txt) symbols)"
+            fi
+
             # 4) hook/patch_memory.c walks the kernel page tables with pmd_leaf()/pud_leaf(),
             #    which only exist since Linux 5.8. On 5.4 arm64 the kernel image is mapped with
             #    2 MB sections, pmd_bad() is true for them and the walk fails with
@@ -330,8 +346,26 @@ jobs:
             NEED_SHIM=0
             if ! grep -rq "ksu_init_rc_hook_key_false" KernelSU-Next/kernel --include=*.c --include=*.h; then
               NEED_SHIM=1
-              printf '%s\n' '' '/* referenced by fs/read_write.c of this tree; never enabled */' \
-                'DEFINE_STATIC_KEY_FALSE(ksu_init_rc_hook_key_false);' >> "$SHIM"
+              MANUAL_GEN=0
+              grep -q "KSU_MANUAL_HOOK" KernelSU-Next/kernel/Kconfig && MANUAL_GEN=1
+              if [ "$MANUAL_GEN" = "1" ]; then
+                # manual-hook generation (official legacy): this tree's hooks drive ksud, so the
+                # keys must be ON (they are switched on once, before userspace starts)
+                printf '%s\n' '' '#include <linux/init.h>' '' \
+                  '/* referenced by fs/read_write.c, drivers/input/input.c of this tree */' \
+                  'DEFINE_STATIC_KEY_FALSE(ksu_init_rc_hook_key_false);' >> "$SHIM"
+                if ! grep -rq "ksu_input_hook_key_false" KernelSU-Next/kernel --include=*.c --include=*.h; then
+                  printf '%s\n' 'DEFINE_STATIC_KEY_FALSE(ksu_input_hook_key_false);' >> "$SHIM"
+                  INPUT_KEY=1
+                fi
+                printf '%s\n' '' 'static int __init ksu_shim_enable_hooks(void)' '{' \
+                  '	static_branch_enable(&ksu_init_rc_hook_key_false);' >> "$SHIM"
+                [ "${INPUT_KEY:-0}" = "1" ] && printf '%s\n' '	static_branch_enable(&ksu_input_hook_key_false);' >> "$SHIM"
+                printf '%s\n' '	return 0;' '}' 'late_initcall(ksu_shim_enable_hooks);' >> "$SHIM"
+              else
+                printf '%s\n' '' '/* referenced by fs/read_write.c of this tree; never enabled */' \
+                  'DEFINE_STATIC_KEY_FALSE(ksu_init_rc_hook_key_false);' >> "$SHIM"
+              fi
               # the key guards a call to ksu_handle_sys_read(); make sure it exists
               if ! grep -rqE "^(int|void) ksu_handle_sys_read" KernelSU-Next/kernel --include=*.c; then
                 printf '%s\n' '' '__attribute__((cold)) int ksu_handle_sys_read(unsigned int fd)' '{' '	return 0;' '}' >> "$SHIM"
@@ -459,17 +493,12 @@ jobs:
             scripts/config --file out/.config -d KSU
             $MK olddefconfig
           elif [ "${KSU_USED:-builtin}" = "latest" ]; then
-            if [ "$LEGACY_KSU" = "1" ]; then
-              # Manual hook mode would need the SUSFS-guarded hooks of this tree (execveat,
-              # faccessat, stat, reboot, input ...), which are compiled out without
-              # CONFIG_KSU_SUSFS -> it links but root would not work. The official legacy branch
-              # has a syscall-table hook mode for non-GKI kernels that needs no tree hooks.
-              scripts/config --file out/.config -d KSU_MANUAL_HOOK -d KSU_KPROBES_HOOK -e KSU_SYSCALL_TABLE_HOOK
-            fi
             $MK olddefconfig
             if [ "$LEGACY_KSU" = "1" ]; then
-              grep -q '^CONFIG_KSU_SYSCALL_TABLE_HOOK=y' out/.config \
-                || echo "::warning::KSU_SYSCALL_TABLE_HOOK did not stick - official-legacy would be built in manual hook mode (no working root)"
+              # official legacy runs in manual-hook mode with this tree's own hooks + SUSFS core
+              for sym in CONFIG_KSU=y CONFIG_KSU_MANUAL_HOOK=y CONFIG_KSU_SUSFS=y; do
+                grep -q "^$sym" out/.config || echo "::warning::$sym missing in the final config - official legacy hooks will not work"
+              done
             fi
             cp out/.config out/.config.latest
             # the newest KernelSU expects the SUSFS 2.0 try_umount / memfd API,
