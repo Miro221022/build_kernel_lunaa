@@ -24,12 +24,16 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Set up Android SDK and NDK
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # The default package 'tools' no longer exists in the SDK repo
+          # and makes sdkmanager fail with exit code 1.
+          packages: ''
 
       - name: Install Android NDK
         run: |
-          sdkmanager "ndk;27.2.12479018"
+          sdkmanager "platform-tools" "ndk;27.2.12479018"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
