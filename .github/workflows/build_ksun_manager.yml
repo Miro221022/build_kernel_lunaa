@@ -49,10 +49,18 @@ jobs:
         working-directory: KernelSU-Next
         run: |
           set -euxo pipefail
+          # Show repo layout so the path is visible in the log
+          ls -la
+          # Locate ksud's Cargo.toml (its path differs between branches)
+          KSUD_MANIFEST="$(grep -rl --include=Cargo.toml -E '^name *= *"ksud"' . | grep -v '/manager/' | head -n1)"
+          test -n "$KSUD_MANIFEST"
+          echo "Using manifest: $KSUD_MANIFEST"
           export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android="--sysroot=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot -I$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android -I$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include"
-          CROSS_NO_WARNINGS=0 cross build --target aarch64-linux-android --release --manifest-path ./userspace/ksud/Cargo.toml
+          CROSS_NO_WARNINGS=0 cross build --target aarch64-linux-android --release --manifest-path "$KSUD_MANIFEST"
+          KSUD_BIN="$(find . -path '*aarch64-linux-android/release/ksud' -type f | head -n1)"
+          test -n "$KSUD_BIN"
           mkdir -p manager/app/src/main/jniLibs/arm64-v8a
-          install -m 755 userspace/ksud/target/aarch64-linux-android/release/ksud manager/app/src/main/jniLibs/arm64-v8a/libksud.so
+          install -m 755 "$KSUD_BIN" manager/app/src/main/jniLibs/arm64-v8a/libksud.so
 
       - name: Build standard Manager APK
         working-directory: KernelSU-Next/manager
