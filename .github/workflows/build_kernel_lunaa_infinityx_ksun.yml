@@ -175,6 +175,24 @@ jobs:
               print('copy_to_kernel_nofault macro removed')
           PY
 
+          # In syscall_table hook mode KernelSU hooks execve/execveat/faccessat/newfstatat,
+          # but NOT reboot(): the manager talks to the kernel through reboot() (supercall).
+          # Without this call the manager shows "Unsupported | Not integrated" although
+          # KernelSU is compiled in. The call must run before the magic/CAP_SYS_BOOT checks.
+          python3 - <<'PY'
+          p = 'kernel/reboot.c'
+          s = open(p).read()
+          if 'ksu_handle_sys_reboot' not in s:
+              k = 'SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,\n\t\tvoid __user *, arg)\n{\n'
+              assert k in s, 'reboot syscall definition not found'
+              i = s.index(k)
+              s = s[:i] + 'extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,\n\t\t\t\t  void __user **arg);\n\n' + s[i:]
+              j = s.index('\tint ret = 0;\n', s.index(k)) + len('\tint ret = 0;\n')
+              s = s[:j] + '\n\t/* KernelSU-Next supercall entry */\n\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n' + s[j:]
+              open(p, 'w').write(s)
+              print('reboot hook added to kernel/reboot.c')
+          PY
+
       - name: Clone clang
         run: |
           git clone --depth=1 -b "${{ inputs.clang_branch }}" \
@@ -253,6 +271,8 @@ jobs:
           if [ "$WANT_KSU" = "true" ]; then
             grep -q ' ksu_' out/System.map || { echo "::error::no ksu_* symbols in System.map - KernelSU was not linked"; exit 1; }
             echo "KernelSU symbols present: $(grep -c ' ksu_' out/System.map)"
+            grep -q ' ksu_handle_sys_reboot' out/System.map || { echo "::error::ksu_handle_sys_reboot missing"; exit 1; }
+            grep -q 'ksu_handle_sys_reboot' kernel/reboot.c 2>/dev/null || grep -q 'ksu_handle_sys_reboot' reboot.c 2>/dev/null || { echo "::error::reboot hook not applied to kernel/reboot.c"; exit 1; }
           fi
           case "$REL" in
             *-dirty) echo "::warning::kernel release ends with -dirty - vendor modules will not match the ROM" ;;
