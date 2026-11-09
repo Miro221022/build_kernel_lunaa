@@ -175,6 +175,22 @@ jobs:
               print('copy_to_kernel_nofault macro removed')
           PY
 
+          # syscall_table mode failed on the device with "failed to find phy addr for patch dst
+          # addr" (0/4 syscalls hooked): phys_from_virt() walks the page tables and rejects 2MB/1GB
+          # section mappings on 5.4 (pmd_bad()/pud_bad() are true for them, and pmd_leaf() does not
+          # exist here). sys_call_table is in the kernel image, so translate it directly.
+          python3 - <<'PY'
+          p = 'KernelSU-Next/kernel/hook/patch_memory.c'
+          s = open(p).read()
+          k = "    *err = 0;\n\n    pgd = pgd_offset(mm, addr);"
+          assert k in s, 'phys_from_virt not found'
+          if '__pa_symbol' not in s:
+              s = s.replace(k, "    *err = 0;\n\n    /* kernel image: avoid the page-table walk, it rejects section mappings on 5.4 */\n    if (addr >= (unsigned long)_text && addr < (unsigned long)_end)\n        return __pa_symbol(addr);\n\n    pgd = pgd_offset(mm, addr);", 1)
+              s = s.replace('#include "asm-generic/fixmap.h"\n', '#include "asm-generic/fixmap.h"\n#include <asm/sections.h>\n', 1)
+              open(p, 'w').write(s)
+              print('phys_from_virt: kernel image shortcut added')
+          PY
+
           # In syscall_table hook mode KernelSU hooks execve/execveat/faccessat/newfstatat,
           # but NOT reboot(): the manager talks to the kernel through reboot() (supercall).
           # Without this call the manager shows "Unsupported | Not integrated" although
