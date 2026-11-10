@@ -58,14 +58,28 @@ on:
         required: true
         default: "legacy"
       ksu_ref:
-        description: "Optional tag/commit of KernelSU Next to pin (empty = branch head)"
+        description: "Optional tag/commit of the KernelSU Next DRIVER (kernel side). Empty = branch head (legacy HEAD = UAPI 6)"
         required: false
         default: ""
+      build_manager:
+        description: "Also build the manager APK, signed with a key whose hash is baked into the kernel"
+        type: boolean
+        required: true
+        default: true
+      manager_ref:
+        description: "Branch/tag/commit of KernelSU Next the MANAGER is built from (dev = UAPI 6, same as legacy HEAD). Its UAPI must equal the driver's"
+        required: true
+        default: "dev"
+      manager_spoofed:
+        description: "Build the spoofed manager (random package name)"
+        type: boolean
+        required: true
+        default: true
       hook_mode:
         description: "KernelSU hook mode"
         type: choice
         required: true
-        default: "syscall_table"
+        default: "kprobes"
         options:
           - syscall_table
           - kprobes
@@ -79,7 +93,148 @@ on:
         default: "master"
 
 jobs:
+  manager:
+    if: ${{ inputs.build_manager }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      cert_size: ${{ steps.sign.outputs.cert_size }}
+      cert_hash: ${{ steps.sign.outputs.cert_hash }}
+      uapi: ${{ steps.src.outputs.uapi }}
+    env:
+      # Optional repo secrets: a FIXED key lets new APKs update the installed manager.
+      # Without them a new throw-away key is made on every run (uninstall the old manager first).
+      KSU_KEYSTORE_B64: ${{ secrets.KSU_KEYSTORE_B64 }}
+      KSU_KEYSTORE_PASSWORD: ${{ secrets.KSU_KEYSTORE_PASSWORD }}
+      KSU_KEY_ALIAS: ${{ secrets.KSU_KEY_ALIAS }}
+      KSU_KEY_PASSWORD: ${{ secrets.KSU_KEY_PASSWORD }}
+    steps:
+      - name: Checkout KernelSU Next (manager + ksud)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.ksu_repo }}
+          ref: ${{ inputs.manager_ref }}
+          path: KernelSU-Next
+          fetch-depth: 0
+
+      - name: Show manager source
+        id: src
+        working-directory: KernelSU-Next
+        run: |
+          git log -1 --format='Manager source: %h %ad %s' --date=short
+          git describe --tags --always
+          echo "commit count: $(git rev-list --count HEAD)"
+          UAPI="$(grep -oE 'KERNEL_SU_UAPI_VERSION[[:space:]=]+[0-9]+' uapi/supercall.h | grep -oE '[0-9]+$' | head -n1)"
+          echo "Manager source UAPI version: $UAPI"
+          [ -n "$UAPI" ]
+          echo "uapi=$UAPI" >> "$GITHUB_OUTPUT"
+
+      - name: Spoof package id
+        if: ${{ inputs.manager_spoofed }}
+        working-directory: KernelSU-Next/manager
+        run: |
+          chmod +x spoof
+          ./spoof
+
+      - name: Prepare signing key
+        id: sign
+        working-directory: KernelSU-Next/manager
+        run: |
+          set -euo pipefail
+          if [ -n "$KSU_KEYSTORE_B64" ]; then
+            echo "Using the keystore from repo secrets"
+            echo "$KSU_KEYSTORE_B64" | base64 -d > key.jks
+            STOREPASS="$KSU_KEYSTORE_PASSWORD"; ALIAS="$KSU_KEY_ALIAS"; KEYPASS="$KSU_KEY_PASSWORD"
+          else
+            echo "::warning::No KSU_KEYSTORE_B64 secret - generating a throw-away key. Uninstall the old manager before installing this APK."
+            STOREPASS="$(openssl rand -hex 12)"; ALIAS="ksunext"; KEYPASS="$STOREPASS"
+            keytool -genkeypair -keystore key.jks -alias "$ALIAS" -keyalg RSA -keysize 2048 \
+              -validity 36500 -storepass "$STOREPASS" -keypass "$KEYPASS" -dname "CN=KernelSU-Next"
+          fi
+          {
+            echo "KEYSTORE_FILE=key.jks"
+            echo "KEYSTORE_PASSWORD=$STOREPASS"
+            echo "KEY_ALIAS=$ALIAS"
+            echo "KEY_PASSWORD=$KEYPASS"
+          } >> gradle.properties
+
+          # What the kernel checks (kernel/manager/apk_sign.c): size and sha256 of the signing certificate (DER)
+          keytool -exportcert -keystore key.jks -alias "$ALIAS" -storepass "$STOREPASS" -file cert.der
+          SIZE="$(stat -c %s cert.der)"
+          HASH="$(sha256sum cert.der | cut -d' ' -f1)"
+          rm -f cert.der
+          echo "Certificate size: $SIZE"
+          echo "Certificate sha256: $HASH"
+          echo "cert_size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "cert_hash=$HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Set up NDK (ksud / bindgen)
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+
+      - name: Set up Rust
+        run: |
+          rustup update stable
+          rustup target add aarch64-linux-android
+
+      - name: Install cross
+        run: RUSTFLAGS="" cargo install cross --git https://github.com/cross-rs/cross --rev 66845c1
+
+      - name: Assemble LKM bootstrap
+        working-directory: KernelSU-Next
+        run: |
+          clang --target=aarch64-linux-gnu -c -nostdlib \
+            -o userspace/ksud/.lkm_image_bootstrap.o \
+            userspace/ksud/src/lkm_image_bootstrap.S
+
+      - name: Build ksud (arm64)
+        working-directory: KernelSU-Next
+        env:
+          BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android: >-
+            --sysroot=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot
+            -I${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android
+            -I${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include
+        run: |
+          set -euxo pipefail
+          CROSS_NO_WARNINGS=0 cross build --target aarch64-linux-android --release \
+            --manifest-path ./userspace/ksud/Cargo.toml
+          KSUD_BIN="$(find userspace/ksud/target -path '*aarch64-linux-android/release/ksud' -type f | head -n1)"
+          test -n "$KSUD_BIN"
+          mkdir -p manager/app/src/main/jniLibs/arm64-v8a
+          install -m 755 "$KSUD_BIN" manager/app/src/main/jniLibs/arm64-v8a/libksud.so
+
+      - name: Build manager APK
+        working-directory: KernelSU-Next/manager
+        run: |
+          set -euxo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon clean assembleRelease
+          mkdir -p "$GITHUB_WORKSPACE/manager-apk"
+          cp app/build/outputs/apk/release/*.apk "$GITHUB_WORKSPACE/manager-apk/"
+          ls -lh "$GITHUB_WORKSPACE/manager-apk"
+
+      - name: Upload manager APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ksun-manager-apk
+          path: manager-apk/*.apk
+          if-no-files-found: error
+
   build:
+    needs: manager
+    # run the kernel when the manager job succeeded OR was skipped (build_manager = false)
+    if: ${{ !cancelled() && (needs.manager.result == 'success' || needs.manager.result == 'skipped') }}
     runs-on: ubuntu-22.04
     timeout-minutes: 180
 
@@ -148,6 +303,15 @@ jobs:
           git -C KernelSU-Next log -1 --format='KernelSU-Next commit: %h %ad %s' --date=short
           git -C KernelSU-Next describe --tags --always || true
           [ -d KernelSU-Next/kernel/core ]
+
+          # UAPI version of the driver. The manager must speak the same one.
+          UAPI="$(grep -oE 'KERNEL_SU_UAPI_VERSION[[:space:]=]+[0-9]+' KernelSU-Next/uapi/supercall.h | grep -oE '[0-9]+$' | head -n1)"
+          echo "KernelSU-Next driver UAPI version: $UAPI"
+          MGR_UAPI="${{ needs.manager.outputs.uapi }}"
+          if [ -n "$MGR_UAPI" ] && [ "$MGR_UAPI" != "$UAPI" ]; then
+            echo "::error::driver UAPI ($UAPI) != manager UAPI ($MGR_UAPI). Change ksu_ref / manager_ref so they match."
+            exit 1
+          fi
 
           # same as KernelSU-Next's setup.sh: symlink + Makefile + Kconfig
           ln -sfn ../KernelSU-Next/kernel drivers/kernelsu
@@ -257,8 +421,14 @@ jobs:
 
       - name: Build
         working-directory: kernel
+        env:
+          # Kbuild: "ifndef KSU_NEXT_MANAGER_SIZE/HASH" -> an empty value keeps the official defaults.
+          # With build_manager the kernel accepts ONLY the APK built in the manager job.
+          KSU_NEXT_MANAGER_SIZE: ${{ needs.manager.outputs.cert_size }}
+          KSU_NEXT_MANAGER_HASH: ${{ needs.manager.outputs.cert_hash }}
         run: |
           export ARCH=arm64 SUBARCH=arm64
+          echo "Manager signature for the kernel: size=${KSU_NEXT_MANAGER_SIZE:-default} hash=${KSU_NEXT_MANAGER_HASH:-default}"
           MK="make O=out CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
 
           # without pipefail the exit code of 'tee' hides a failed make
@@ -281,6 +451,7 @@ jobs:
         working-directory: kernel
         env:
           WANT_KSU: ${{ inputs.ksu }}
+          KSU_NEXT_MANAGER_HASH: ${{ needs.manager.outputs.cert_hash }}
         run: |
           REL="$(cat out/include/config/kernel.release)"
           echo "Kernel release: $REL"
@@ -289,6 +460,10 @@ jobs:
             echo "KernelSU symbols present: $(grep -c ' ksu_' out/System.map)"
             grep -q ' ksu_handle_sys_reboot' out/System.map || { echo "::error::ksu_handle_sys_reboot missing"; exit 1; }
             grep -q 'ksu_handle_sys_reboot' kernel/reboot.c 2>/dev/null || grep -q 'ksu_handle_sys_reboot' reboot.c 2>/dev/null || { echo "::error::reboot hook not applied to kernel/reboot.c"; exit 1; }
+          fi
+          if [ -n "$KSU_NEXT_MANAGER_HASH" ]; then
+            grep -q "Manager signature hash: $KSU_NEXT_MANAGER_HASH" ../build.log || { echo "::error::custom manager signature hash was not picked up by Kbuild"; exit 1; }
+            echo "Custom manager signature is in the kernel"
           fi
           case "$REL" in
             *-dirty) echo "::warning::kernel release ends with -dirty - vendor modules will not match the ROM" ;;
@@ -358,6 +533,7 @@ jobs:
             echo "- Kernel commit: \`$(git -C kernel rev-parse --short=12 HEAD 2>/dev/null || echo n/a)\`"
             echo "- Kernel release: \`$(cat kernel/out/include/config/kernel.release 2>/dev/null || echo n/a)\` (ROM: \`5.4.302-qgki-g9dc2276af4b1\`)"
             echo "- KernelSU Next: $(git -C kernel/KernelSU-Next describe --tags --always 2>/dev/null || echo none)"
+            echo "- Manager APK: ${{ inputs.build_manager && 'built (artifact ksun-manager-apk)' || 'not built' }}, manager UAPI: \`${{ needs.manager.outputs.uapi }}\`"
             grep -E "^CONFIG_KSU" kernel/out/.config 2>/dev/null | sed 's/^/    /' || true
           } >> "$GITHUB_STEP_SUMMARY"
 
