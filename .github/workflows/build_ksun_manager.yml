@@ -10,11 +10,11 @@ jobs:
   build-manager:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout KernelSU-Next legacy source
+      - name: Checkout KernelSU-Next source (manager + ksud)
         uses: actions/checkout@v4
         with:
           repository: KernelSU-Next/KernelSU-Next
-          ref: v3.4.0-legacy
+          ref: v3.4.2
           path: KernelSU-Next
           fetch-depth: 0
 
