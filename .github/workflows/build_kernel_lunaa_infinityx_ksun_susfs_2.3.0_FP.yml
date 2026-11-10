@@ -87,7 +87,7 @@ on:
         required: false
         default: "fbd7c23d19c7c7a64f823cb788526b91bbb96690"
       fp_screenoff_wake:
-        description: "EXPERIMENTAL: wake the screen (KEY_WAKEUP) when the under-display fingerprint sensor is touched while the screen is off and let the same touch unlock (UI_READY netlink event, no sysfs/SELinux)"
+        description: "EXPERIMENTAL: wake the screen (KEY_WAKEUP) when the under-display fingerprint sensor is touched while the screen is off and let the same touch unlock (in-kernel notify_fp_press, no sysfs/SELinux)"
         type: boolean
         required: true
         default: true
@@ -381,7 +381,9 @@ jobs:
           #include <linux/module.h>
           /* Screen-off wake, finger held on the sensor:
            *  1. touch down (screen off)  -> KEY_WAKEUP, the screen wakes up
-           *  2. NET SCREEN ON            -> after a short delay send ANC_NETLINK_EVENT_UI_READY to the HAL.
+           *  2. NET SCREEN ON            -> after a short delay call the display driver's notify_fp_press(1) in-kernel
+           * (sets oplus_onscreenfp_status, so sde_crtc stops skipping the fppressed layer and the real
+           * UI ready / HBM comes from sde_crtc_complete_commit); notify_fp_press(0) on touch up.
            * The HAL has already started authenticate on the first touch down and is blocked in "wait hbm
            * event". Normally SystemUI/the display driver produce that event, but the touch started while
            * the screen was off, so SystemUI never sees an ACTION_DOWN. We send the same netlink message
@@ -394,19 +396,29 @@ jobs:
           static struct delayed_work anc_rewake_work;
           static struct delayed_work anc_wake_timeout_work;
           static bool anc_wake_pending;
+          static bool anc_fp_pressed;
+          static struct work_struct anc_release_work;
+          extern int anc_display_notify_fp_press(int val);
 
           static void anc_rewake_fn(struct work_struct *work)
           {
-              char msg = (char)ANC_NETLINK_EVENT_UI_READY;
-
               if (!anc_wake_pending)
                   return;
               anc_wake_pending = false;
               cancel_delayed_work(&anc_wake_timeout_work);
               /* only if the screen is really on and the finger is still down */
               if (g_anc_data && !g_anc_data->fb_black && lasttouchmode == 1) {
-                  pr_info("[anc] screen-off wake: send UI ready\n");
-                  netlink_send_message_to_user(&msg, sizeof(msg));
+                  pr_info("[anc] screen-off wake: notify_fp_press(1)\n");
+                  anc_fp_pressed = true;
+                  anc_display_notify_fp_press(1);
+              }
+          }
+
+          static void anc_release_fn(struct work_struct *work)
+          {
+              if (anc_fp_pressed) {
+                  anc_fp_pressed = false;
+                  anc_display_notify_fp_press(0);
               }
           }
 
@@ -420,12 +432,15 @@ jobs:
               anc_wake_pending = false;
               cancel_delayed_work(&anc_rewake_work);
               cancel_delayed_work(&anc_wake_timeout_work);
+              if (anc_fp_pressed)
+                  schedule_work(&anc_release_work);
           }
 
           static void anc_wake_register(void)
           {
               INIT_DELAYED_WORK(&anc_rewake_work, anc_rewake_fn);
               INIT_DELAYED_WORK(&anc_wake_timeout_work, anc_wake_timeout_fn);
+              INIT_WORK(&anc_release_work, anc_release_fn);
               if (anc_wake_dev)
                   return;
               anc_wake_dev = input_allocate_device();
@@ -444,6 +459,7 @@ jobs:
           {
               cancel_delayed_work_sync(&anc_rewake_work);
               cancel_delayed_work_sync(&anc_wake_timeout_work);
+              cancel_work_sync(&anc_release_work);
               anc_wake_pending = false;
               if (anc_wake_dev) {
                   input_unregister_device(anc_wake_dev);
@@ -484,6 +500,31 @@ jobs:
               s = s.replace(k, '    anc_wake_unregister();\n' + k, 1)
               open(p, 'w').write(s)
               print('fingerprint screen-off wake added')
+          PY
+
+      - name: Fingerprint screen-off wake - display notify_fp_press wrapper
+        if: ${{ inputs.fp_screenoff_wake }}
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re
+          p = 'techpack/display/oplus/oplus_display_private_api.c'
+          s = open(p).read()
+          if 'anc_display_notify_fp_press' not in s:
+              m = re.search(r'static\s+ssize_t\s+(\w*notify_fp_press\w*)\s*\(', s)
+              assert m, 'notify_fp_press not found in ' + p
+              fn = m.group(1)
+              s += '''
+          /* in-kernel entry for the fingerprint screen-off wake (see jiiov_platform.c) */
+          int anc_display_notify_fp_press(int val)
+          {
+              return (int)%s(NULL, NULL, val ? "1" : "0", 1);
+          }
+          EXPORT_SYMBOL(anc_display_notify_fp_press);
+          ''' % fn
+              open(p, 'w').write(s)
+              print('notify_fp_press wrapper added, target:', fn)
           PY
 
       - name: Add KernelSU Next
