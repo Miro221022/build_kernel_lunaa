@@ -87,7 +87,7 @@ on:
         required: false
         default: "fbd7c23d19c7c7a64f823cb788526b91bbb96690"
       fp_screenoff_wake:
-        description: "EXPERIMENTAL: wake the screen (KEY_WAKEUP) when the under-display fingerprint sensor is touched while the screen is off and let the same touch unlock (in-kernel notify_fp_press, no sysfs/SELinux)"
+        description: "EXPERIMENTAL: wake the screen (KEY_WAKEUP) when the under-display fingerprint sensor is touched while the screen is off and let the same touch unlock (UI_READY netlink event, no sysfs/SELinux)"
         type: boolean
         required: true
         default: true
@@ -376,14 +376,17 @@ jobs:
           s = open(p).read()
           if 'anc_wake_screen' not in s:
               helpers = r'''#include <linux/input.h>
+          #include <linux/input/mt.h>
+          #include <linux/mutex.h>
           #include <linux/workqueue.h>
           #include <linux/delay.h>
           #include <linux/module.h>
           /* Screen-off wake, finger held on the sensor:
            *  1. touch down (screen off)  -> KEY_WAKEUP, the screen wakes up
-           *  2. NET SCREEN ON            -> after a short delay call the display driver's notify_fp_press(1) in-kernel
-           * (sets oplus_onscreenfp_status, so sde_crtc stops skipping the fppressed layer and the real
-           * UI ready / HBM comes from sde_crtc_complete_commit); notify_fp_press(0) on touch up.
+           *  2. NET SCREEN ON            -> after a short delay inject a synthetic touch DOWN at the sensor
+           * (virtual touchscreen) so SystemUI gets a real ACTION_DOWN on the already attached UDFPS overlay;
+           * it then draws the fppressed layer and the real UI ready/HBM comes from sde_crtc_complete_commit.
+           * Touch UP is injected after the real finger is lifted.
            * The HAL has already started authenticate on the first touch down and is blocked in "wait hbm
            * event". Normally SystemUI/the display driver produce that event, but the touch started while
            * the screen was off, so SystemUI never sees an ACTION_DOWN. We send the same netlink message
@@ -396,15 +399,40 @@ jobs:
           static struct delayed_work anc_rewake_work;
           static struct delayed_work anc_wake_timeout_work;
           static bool anc_wake_pending;
-          static bool anc_fp_pressed;
-          static struct work_struct anc_release_work;
-          int (*anc_display_notify_fp_press_hook)(int val);
-          EXPORT_SYMBOL(anc_display_notify_fp_press_hook);
-          static int anc_display_notify_fp_press(int val)
-          {
-              int (*fn)(int) = READ_ONCE(anc_display_notify_fp_press_hook);
 
-              return fn ? fn(val) : -ENODEV;
+          /* virtual touchscreen: same coordinate space as the "touchpanel" device (8640x19200 = 1080x2400 px * 8) */
+          #define ANC_FP_X   4361   /* sensor centre, measured with getevent (~545 px) */
+          #define ANC_FP_Y   17484  /* ~2185 px */
+          static struct input_dev *anc_touch_dev;
+          static struct work_struct anc_release_work;
+          static DEFINE_MUTEX(anc_touch_lock);
+          static bool anc_touch_down;
+
+          static void anc_touch_inject(bool down)
+          {
+              mutex_lock(&anc_touch_lock);
+              if (!anc_touch_dev || anc_touch_down == down)
+                  goto out;
+              anc_touch_down = down;
+              input_mt_slot(anc_touch_dev, 0);
+              if (down) {
+                  input_mt_report_slot_state(anc_touch_dev, MT_TOOL_FINGER, true);
+                  input_report_abs(anc_touch_dev, ABS_MT_POSITION_X, ANC_FP_X);
+                  input_report_abs(anc_touch_dev, ABS_MT_POSITION_Y, ANC_FP_Y);
+                  input_report_abs(anc_touch_dev, ABS_MT_TOUCH_MAJOR, 10);
+                  input_report_key(anc_touch_dev, BTN_TOUCH, 1);
+              } else {
+                  input_mt_report_slot_state(anc_touch_dev, MT_TOOL_FINGER, false);
+                  input_report_key(anc_touch_dev, BTN_TOUCH, 0);
+              }
+              input_sync(anc_touch_dev);
+          out:
+              mutex_unlock(&anc_touch_lock);
+          }
+
+          static void anc_release_fn(struct work_struct *work)
+          {
+              anc_touch_inject(false);
           }
 
           static void anc_rewake_fn(struct work_struct *work)
@@ -415,17 +443,8 @@ jobs:
               cancel_delayed_work(&anc_wake_timeout_work);
               /* only if the screen is really on and the finger is still down */
               if (g_anc_data && !g_anc_data->fb_black && lasttouchmode == 1) {
-                  pr_info("[anc] screen-off wake: notify_fp_press(1)\n");
-                  anc_fp_pressed = true;
-                  anc_display_notify_fp_press(1);
-              }
-          }
-
-          static void anc_release_fn(struct work_struct *work)
-          {
-              if (anc_fp_pressed) {
-                  anc_fp_pressed = false;
-                  anc_display_notify_fp_press(0);
+                  pr_info("[anc] screen-off wake: inject touch down\n");
+                  anc_touch_inject(true);
               }
           }
 
@@ -439,7 +458,7 @@ jobs:
               anc_wake_pending = false;
               cancel_delayed_work(&anc_rewake_work);
               cancel_delayed_work(&anc_wake_timeout_work);
-              if (anc_fp_pressed)
+              if (anc_touch_down)
                   schedule_work(&anc_release_work);
           }
 
@@ -450,6 +469,21 @@ jobs:
               INIT_WORK(&anc_release_work, anc_release_fn);
               if (anc_wake_dev)
                   return;
+              anc_touch_dev = input_allocate_device();
+              if (anc_touch_dev) {
+                  anc_touch_dev->name = "anc_fp_touch";
+                  anc_touch_dev->id.bustype = BUS_HOST;
+                  __set_bit(INPUT_PROP_DIRECT, anc_touch_dev->propbit);
+                  input_set_capability(anc_touch_dev, EV_KEY, BTN_TOUCH);
+                  input_set_abs_params(anc_touch_dev, ABS_MT_POSITION_X, 0, 8639, 0, 0);
+                  input_set_abs_params(anc_touch_dev, ABS_MT_POSITION_Y, 0, 19199, 0, 0);
+                  input_set_abs_params(anc_touch_dev, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
+                  if (input_mt_init_slots(anc_touch_dev, 1, INPUT_MT_DIRECT) ||
+                      input_register_device(anc_touch_dev)) {
+                      input_free_device(anc_touch_dev);
+                      anc_touch_dev = NULL;
+                  }
+              }
               anc_wake_dev = input_allocate_device();
               if (!anc_wake_dev)
                   return;
@@ -468,6 +502,10 @@ jobs:
               cancel_delayed_work_sync(&anc_wake_timeout_work);
               cancel_work_sync(&anc_release_work);
               anc_wake_pending = false;
+              if (anc_touch_dev) {
+                  input_unregister_device(anc_touch_dev);
+                  anc_touch_dev = NULL;
+              }
               if (anc_wake_dev) {
                   input_unregister_device(anc_wake_dev);
                   anc_wake_dev = NULL;
@@ -507,53 +545,6 @@ jobs:
               s = s.replace(k, '    anc_wake_unregister();\n' + k, 1)
               open(p, 'w').write(s)
               print('fingerprint screen-off wake added')
-          PY
-
-      - name: Fingerprint screen-off wake - display notify_fp_press wrapper
-        if: ${{ inputs.fp_screenoff_wake }}
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import re
-          p = 'techpack/display/oplus/oplus_display_private_api.c'
-          s = open(p).read()
-          if 'anc_display_notify_fp_press_impl' not in s:
-              m = re.search(r'static\s+ssize_t\s+(\w*notify_fp_press\w*)\s*\(', s)
-              assert m, 'notify_fp_press not found in ' + p
-              fn = m.group(1)
-              # first non-static init-like function that creates the sysfs nodes
-              init = None
-              for im in re.finditer(r'\n(?:int|static int)\s+(?:__init\s+)?(\w+)\s*\(\s*(?:void)?\s*\)\s*\n?\{', s):
-                  body = s[im.end():im.end() + 3000]
-                  if re.search(r'kobject_create_and_add|sysfs_create|proc_create', body):
-                      init = im
-                      break
-              assert init, 'display init function not found in ' + p
-              pre = '''
-          extern int (*anc_display_notify_fp_press_hook)(int val);
-          static int anc_display_notify_fp_press_impl(int val);
-          '''
-              s = s[:init.start() + 1] + pre + s[init.start() + 1:]
-              init = re.search(r'\n(?:int|static int)\s+(?:__init\s+)?' + re.escape(init.group(1)) + r'\s*\(\s*(?:void)?\s*\)\s*\n?\{', s)
-              # insert before the last return of the init function (after all declarations: -Werror=declaration-after-statement)
-              depth, i = 1, init.end()
-              while depth:
-                  depth += {'{': 1, '}': -1}.get(s[i], 0)
-                  i += 1
-              end = i - 1
-              r = s.rfind('return', init.end(), end)
-              pos = s.rfind('\n', init.end(), r) + 1 if r != -1 else end
-              s = s[:pos] + '    anc_display_notify_fp_press_hook = anc_display_notify_fp_press_impl;\n' + s[pos:]
-              s += '''
-          /* in-kernel entry for the fingerprint screen-off wake (see jiiov_platform.c) */
-          static int anc_display_notify_fp_press_impl(int val)
-          {
-              return (int)%s(NULL, NULL, val ? "1" : "0", 1);
-          }
-          ''' % fn
-              open(p, 'w').write(s)
-              print('notify_fp_press hook added, target:', fn)
           PY
 
       - name: Add KernelSU Next
