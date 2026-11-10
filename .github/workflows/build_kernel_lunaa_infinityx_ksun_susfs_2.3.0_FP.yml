@@ -372,6 +372,17 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
+          dp = 'techpack/display/oplus/oplus_display_private_api.c'
+          d = open(dp).read()
+          if 'oplus_display_kernel_notify_fp_press' not in d:
+              k = 'static OPLUS_ATTR(notify_fppress, S_IRUGO | S_IWUSR, NULL,'
+              assert d.count(k) == 1
+              wrapper = (
+          'int oplus_display_kernel_notify_fp_press(int on)\n{\n'
+          '\tchar b[2] = { on ? \'1\' : \'0\', 0 };\n\n'
+          '\toplus_display_notify_fp_press(NULL, NULL, b, 1);\n'
+          '\treturn 0;\n}\nEXPORT_SYMBOL(oplus_display_kernel_notify_fp_press);\n\n')
+              open(dp, 'w').write(d.replace(k, wrapper + k, 1))
           p = 'drivers/input/oplus_fp_drivers/anc_driver/jiiov_platform.c'
           s = open(p).read()
           if 'anc_wake_screen' not in s:
@@ -387,19 +398,10 @@ jobs:
           static bool anc_fp_press_set;
 
           /* same thing SystemUI does on pointer down: tell the display driver the finger is pressed */
+          extern int oplus_display_kernel_notify_fp_press(int on);
           static void anc_fp_press(int on)
           {
-              struct file *f;
-              loff_t pos = 0;
-              char c = on ? '1' : '0';
-
-              f = filp_open("/sys/kernel/oplus_display/notify_fppress", O_WRONLY, 0);
-              if (IS_ERR(f)) {
-                  pr_err("[anc] open notify_fppress failed: %ld\n", PTR_ERR(f));
-                  return;
-              }
-              kernel_write(f, &c, 1, &pos);
-              filp_close(f, NULL);
+              oplus_display_kernel_notify_fp_press(on);
           }
 
           static void anc_unpress_fn(struct work_struct *work)
