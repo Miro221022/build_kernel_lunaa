@@ -536,7 +536,15 @@ jobs:
           '''
               s = s[:init.start() + 1] + pre + s[init.start() + 1:]
               init = re.search(r'\n(?:int|static int)\s+(?:__init\s+)?' + re.escape(init.group(1)) + r'\s*\(\s*(?:void)?\s*\)\s*\n?\{', s)
-              s = s[:init.end()] + '\n    anc_display_notify_fp_press_hook = anc_display_notify_fp_press_impl;' + s[init.end():]
+              # insert before the last return of the init function (after all declarations: -Werror=declaration-after-statement)
+              depth, i = 1, init.end()
+              while depth:
+                  depth += {'{': 1, '}': -1}.get(s[i], 0)
+                  i += 1
+              end = i - 1
+              r = s.rfind('return', init.end(), end)
+              pos = s.rfind('\n', init.end(), r) + 1 if r != -1 else end
+              s = s[:pos] + '    anc_display_notify_fp_press_hook = anc_display_notify_fp_press_impl;\n' + s[pos:]
               s += '''
           /* in-kernel entry for the fingerprint screen-off wake (see jiiov_platform.c) */
           static int anc_display_notify_fp_press_impl(int val)
