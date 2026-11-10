@@ -90,7 +90,7 @@ on:
         description: "EXPERIMENTAL: wake the screen (KEY_WAKEUP) when the under-display fingerprint sensor is touched while the screen is off"
         type: boolean
         required: true
-        default: false
+        default: true
       build_manager:
         description: "Also build the manager APK, signed with a key whose hash is baked into the kernel"
         type: boolean
@@ -372,17 +372,6 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          dp = 'techpack/display/oplus/oplus_display_private_api.c'
-          d = open(dp).read()
-          if 'oplus_display_kernel_notify_fp_press' not in d:
-              k = 'static OPLUS_ATTR(notify_fppress, S_IRUGO | S_IWUSR, NULL,'
-              assert d.count(k) == 1
-              wrapper = (
-          'int oplus_display_kernel_notify_fp_press(int on)\n{\n'
-          '\tchar b[2] = { on ? \'1\' : \'0\', 0 };\n\n'
-          '\toplus_display_notify_fp_press(NULL, NULL, b, 1);\n'
-          '\treturn 0;\n}\nEXPORT_SYMBOL(oplus_display_kernel_notify_fp_press);\n\n')
-              open(dp, 'w').write(d.replace(k, wrapper + k, 1))
           p = 'drivers/input/oplus_fp_drivers/anc_driver/jiiov_platform.c'
           s = open(p).read()
           if 'anc_wake_screen' not in s:
@@ -391,27 +380,28 @@ jobs:
           #include <linux/fs.h>
           #include <linux/delay.h>
           #include <linux/module.h>
-          #define ANC_REWAKE_DELAY_MS 200
+          #define ANC_REWAKE_DELAY_MS 30
           static struct input_dev *anc_wake_dev;
           static struct delayed_work anc_rewake_work;
           static struct work_struct anc_unpress_work;
           static bool anc_wake_pending;
           static bool anc_fp_press_set;
 
-          /* same thing SystemUI does on pointer down: tell the display driver the finger is pressed */
-          /* the display driver is a module, so resolve its symbol at runtime */
-          extern int oplus_display_kernel_notify_fp_press(int on);
+          /* same thing SystemUI does on pointer down: write to the display driver's sysfs node
+           * (the display driver is a ROM module that is not flashed, so no symbol can be used) */
           static void anc_fp_press(int on)
           {
-              int (*fn)(int);
+              struct file *f;
+              loff_t pos = 0;
+              char b[2] = { on ? '1' : '0', 0 };
 
-              fn = symbol_get(oplus_display_kernel_notify_fp_press);
-              if (!fn) {
-                  pr_err("[anc] display notify symbol not available\n");
+              f = filp_open("/sys/kernel/oplus_display/notify_fppress", O_WRONLY, 0);
+              if (IS_ERR(f)) {
+                  pr_err("[anc] open notify_fppress failed: %ld\n", PTR_ERR(f));
                   return;
               }
-              fn(on);
-              symbol_put(oplus_display_kernel_notify_fp_press);
+              kernel_write(f, b, 1, &pos);
+              filp_close(f, NULL);
           }
 
           static void anc_unpress_fn(struct work_struct *work)
@@ -424,18 +414,13 @@ jobs:
 
           static void anc_rewake_fn(struct work_struct *work)
           {
-              char msg = (char)ANC_NETLINK_EVENT_TOUCH_DOWN;
-
               anc_wake_pending = false;
-              /* finger is still on the sensor after the wake: restart the auth flow */
+              /* finger is still on the sensor after the wake: tell the display driver (HBM + UI ready).
+               * The HAL already started authenticate on the first touch down and waits for the HBM event. */
               if (g_anc_data && !g_anc_data->fb_black && lasttouchmode == 1) {
-                  pr_info("[anc] resend touch down after screen-off wake\n");
-                  netlink_send_message_to_user(&msg, sizeof(msg));
-                  msleep(20);
-                  if (lasttouchmode == 1) {
-                      anc_fp_press_set = true;
-                      anc_fp_press(1);
-                  }
+                  pr_info("[anc] screen-off wake: notify fp press\n");
+                  anc_fp_press_set = true;
+                  anc_fp_press(1);
               }
           }
 
