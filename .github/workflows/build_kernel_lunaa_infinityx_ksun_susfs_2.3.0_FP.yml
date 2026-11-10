@@ -398,7 +398,14 @@ jobs:
           static bool anc_wake_pending;
           static bool anc_fp_pressed;
           static struct work_struct anc_release_work;
-          extern int anc_display_notify_fp_press(int val);
+          int (*anc_display_notify_fp_press_hook)(int val);
+          EXPORT_SYMBOL(anc_display_notify_fp_press_hook);
+          static int anc_display_notify_fp_press(int val)
+          {
+              int (*fn)(int) = READ_ONCE(anc_display_notify_fp_press_hook);
+
+              return fn ? fn(val) : -ENODEV;
+          }
 
           static void anc_rewake_fn(struct work_struct *work)
           {
@@ -511,20 +518,34 @@ jobs:
           import re
           p = 'techpack/display/oplus/oplus_display_private_api.c'
           s = open(p).read()
-          if 'anc_display_notify_fp_press' not in s:
+          if 'anc_display_notify_fp_press_impl' not in s:
               m = re.search(r'static\s+ssize_t\s+(\w*notify_fp_press\w*)\s*\(', s)
               assert m, 'notify_fp_press not found in ' + p
               fn = m.group(1)
+              # first non-static init-like function that creates the sysfs nodes
+              init = None
+              for im in re.finditer(r'\n(?:int|static int)\s+(?:__init\s+)?(\w+)\s*\(\s*(?:void)?\s*\)\s*\n?\{', s):
+                  body = s[im.end():im.end() + 3000]
+                  if re.search(r'kobject_create_and_add|sysfs_create|proc_create', body):
+                      init = im
+                      break
+              assert init, 'display init function not found in ' + p
+              pre = '''
+          extern int (*anc_display_notify_fp_press_hook)(int val);
+          static int anc_display_notify_fp_press_impl(int val);
+          '''
+              s = s[:init.start() + 1] + pre + s[init.start() + 1:]
+              init = re.search(r'\n(?:int|static int)\s+(?:__init\s+)?' + re.escape(init.group(1)) + r'\s*\(\s*(?:void)?\s*\)\s*\n?\{', s)
+              s = s[:init.end()] + '\n    anc_display_notify_fp_press_hook = anc_display_notify_fp_press_impl;' + s[init.end():]
               s += '''
           /* in-kernel entry for the fingerprint screen-off wake (see jiiov_platform.c) */
-          int anc_display_notify_fp_press(int val)
+          static int anc_display_notify_fp_press_impl(int val)
           {
               return (int)%s(NULL, NULL, val ? "1" : "0", 1);
           }
-          EXPORT_SYMBOL(anc_display_notify_fp_press);
           ''' % fn
               open(p, 'w').write(s)
-              print('notify_fp_press wrapper added, target:', fn)
+              print('notify_fp_press hook added, target:', fn)
           PY
 
       - name: Add KernelSU Next
