@@ -377,8 +377,21 @@ jobs:
           if 'anc_wake_screen' not in s:
               helpers = (
           '#include <linux/input.h>\n'
-          'static struct input_dev *anc_wake_dev;\n\n'
+          '#include <linux/workqueue.h>\n'
+          '#define ANC_REWAKE_DELAY_MS 200\n'
+          'static struct input_dev *anc_wake_dev;\n'
+          'static struct delayed_work anc_rewake_work;\n'
+          'static bool anc_wake_pending;\n\n'
+          'static void anc_rewake_fn(struct work_struct *work)\n{\n'
+          '    char msg = (char)ANC_NETLINK_EVENT_TOUCH_DOWN;\n\n'
+          '    anc_wake_pending = false;\n'
+          '    /* finger is still on the sensor after the wake: restart the auth flow */\n'
+          '    if (g_anc_data && !g_anc_data->fb_black && lasttouchmode == 1) {\n'
+          '        pr_info("[anc] resend touch down after screen-off wake\\n");\n'
+          '        netlink_send_message_to_user(&msg, sizeof(msg));\n'
+          '    }\n}\n\n'
           'static void anc_wake_register(void)\n{\n'
+          '    INIT_DELAYED_WORK(&anc_rewake_work, anc_rewake_fn);\n'
           '    if (anc_wake_dev)\n        return;\n'
           '    anc_wake_dev = input_allocate_device();\n'
           '    if (!anc_wake_dev)\n        return;\n'
@@ -389,11 +402,13 @@ jobs:
           '        input_free_device(anc_wake_dev);\n'
           '        anc_wake_dev = NULL;\n    }\n}\n\n'
           'static void anc_wake_unregister(void)\n{\n'
+          '    cancel_delayed_work_sync(&anc_rewake_work);\n'
           '    if (anc_wake_dev) {\n'
           '        input_unregister_device(anc_wake_dev);\n'
           '        anc_wake_dev = NULL;\n    }\n}\n\n'
           'static void anc_wake_screen(void)\n{\n'
           '    if (!anc_wake_dev)\n        return;\n'
+          '    anc_wake_pending = true;\n'
           '    input_report_key(anc_wake_dev, KEY_WAKEUP, 1);\n'
           '    input_sync(anc_wake_dev);\n'
           '    input_report_key(anc_wake_dev, KEY_WAKEUP, 0);\n'
@@ -404,6 +419,9 @@ jobs:
               k = '        pr_info("[anc] Netlink touch down!");\n        netlink_send_message_to_user(&netlink_msg, sizeof(netlink_msg));\n'
               assert k in s
               s = s.replace(k, k + '        if (g_anc_data->fb_black)\n            anc_wake_screen();\n', 1)
+              k = '                pr_info("[anc] NET SCREEN ON!\\n");\n                netlink_send_message_to_user(&netlink_msg, sizeof(netlink_msg));\n'
+              assert k in s
+              s = s.replace(k, k + '                if (anc_wake_pending)\n                    schedule_delayed_work(&anc_rewake_work, msecs_to_jiffies(ANC_REWAKE_DELAY_MS));\n', 1)
               k = '    g_anc_data = dev_data;\n'
               assert k in s
               s = s.replace(k, k + '    anc_wake_register();\n', 1)
