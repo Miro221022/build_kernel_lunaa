@@ -390,6 +390,7 @@ jobs:
           #include <linux/workqueue.h>
           #include <linux/fs.h>
           #include <linux/delay.h>
+          #include <linux/module.h>
           #define ANC_REWAKE_DELAY_MS 200
           static struct input_dev *anc_wake_dev;
           static struct delayed_work anc_rewake_work;
@@ -398,10 +399,19 @@ jobs:
           static bool anc_fp_press_set;
 
           /* same thing SystemUI does on pointer down: tell the display driver the finger is pressed */
+          /* the display driver is a module, so resolve its symbol at runtime */
           extern int oplus_display_kernel_notify_fp_press(int on);
           static void anc_fp_press(int on)
           {
-              oplus_display_kernel_notify_fp_press(on);
+              int (*fn)(int);
+
+              fn = symbol_get(oplus_display_kernel_notify_fp_press);
+              if (!fn) {
+                  pr_err("[anc] display notify symbol not available\n");
+                  return;
+              }
+              fn(on);
+              symbol_put(oplus_display_kernel_notify_fp_press);
           }
 
           static void anc_unpress_fn(struct work_struct *work)
