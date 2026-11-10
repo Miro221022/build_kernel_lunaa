@@ -87,7 +87,7 @@ on:
         required: false
         default: "fbd7c23d19c7c7a64f823cb788526b91bbb96690"
       fp_screenoff_wake:
-        description: "EXPERIMENTAL: wake the screen (KEY_WAKEUP) when the under-display fingerprint sensor is touched while the screen is off"
+        description: "EXPERIMENTAL: wake the screen (KEY_WAKEUP) when the under-display fingerprint sensor is touched while the screen is off and let the same touch unlock (UI_READY netlink event, no sysfs/SELinux)"
         type: boolean
         required: true
         default: true
@@ -377,57 +377,55 @@ jobs:
           if 'anc_wake_screen' not in s:
               helpers = r'''#include <linux/input.h>
           #include <linux/workqueue.h>
-          #include <linux/fs.h>
           #include <linux/delay.h>
           #include <linux/module.h>
-          #define ANC_REWAKE_DELAY_MS 30
+          /* Screen-off wake, finger held on the sensor:
+           *  1. touch down (screen off)  -> KEY_WAKEUP, the screen wakes up
+           *  2. NET SCREEN ON            -> after a short delay send ANC_NETLINK_EVENT_UI_READY to the HAL.
+           * The HAL has already started authenticate on the first touch down and is blocked in "wait hbm
+           * event". Normally SystemUI/the display driver produce that event, but the touch started while
+           * the screen was off, so SystemUI never sees an ACTION_DOWN. We send the same netlink message
+           * ourselves. No sysfs write and no SELinux rule are involved (a filp_open() of
+           * /sys/kernel/oplus_display/notify_fppress from a kworker is denied: u:r:kernel:s0 has no
+           * search on vendor_sysfs_graphics). */
+          #define ANC_REWAKE_DELAY_MS   150   /* HBM-on is issued ~90 ms after NET SCREEN ON; let it settle */
+          #define ANC_WAKE_TIMEOUT_MS   1500  /* give up waiting for the screen: never leave the flag stuck */
           static struct input_dev *anc_wake_dev;
           static struct delayed_work anc_rewake_work;
-          static struct work_struct anc_unpress_work;
+          static struct delayed_work anc_wake_timeout_work;
           static bool anc_wake_pending;
-          static bool anc_fp_press_set;
-
-          /* same thing SystemUI does on pointer down: write to the display driver's sysfs node
-           * (the display driver is a ROM module that is not flashed, so no symbol can be used) */
-          static void anc_fp_press(int on)
-          {
-              struct file *f;
-              loff_t pos = 0;
-              char b[2] = { on ? '1' : '0', 0 };
-
-              f = filp_open("/sys/kernel/oplus_display/notify_fppress", O_WRONLY, 0);
-              if (IS_ERR(f)) {
-                  pr_err("[anc] open notify_fppress failed: %ld\n", PTR_ERR(f));
-                  return;
-              }
-              kernel_write(f, b, 1, &pos);
-              filp_close(f, NULL);
-          }
-
-          static void anc_unpress_fn(struct work_struct *work)
-          {
-              if (anc_fp_press_set) {
-                  anc_fp_press_set = false;
-                  anc_fp_press(0);
-              }
-          }
 
           static void anc_rewake_fn(struct work_struct *work)
           {
+              char msg = (char)ANC_NETLINK_EVENT_UI_READY;
+
+              if (!anc_wake_pending)
+                  return;
               anc_wake_pending = false;
-              /* finger is still on the sensor after the wake: tell the display driver (HBM + UI ready).
-               * The HAL already started authenticate on the first touch down and waits for the HBM event. */
+              cancel_delayed_work(&anc_wake_timeout_work);
+              /* only if the screen is really on and the finger is still down */
               if (g_anc_data && !g_anc_data->fb_black && lasttouchmode == 1) {
-                  pr_info("[anc] screen-off wake: notify fp press\n");
-                  anc_fp_press_set = true;
-                  anc_fp_press(1);
+                  pr_info("[anc] screen-off wake: send UI ready\n");
+                  netlink_send_message_to_user(&msg, sizeof(msg));
               }
+          }
+
+          static void anc_wake_timeout_fn(struct work_struct *work)
+          {
+              anc_wake_pending = false;
+          }
+
+          static void anc_wake_cancel(void)
+          {
+              anc_wake_pending = false;
+              cancel_delayed_work(&anc_rewake_work);
+              cancel_delayed_work(&anc_wake_timeout_work);
           }
 
           static void anc_wake_register(void)
           {
               INIT_DELAYED_WORK(&anc_rewake_work, anc_rewake_fn);
-              INIT_WORK(&anc_unpress_work, anc_unpress_fn);
+              INIT_DELAYED_WORK(&anc_wake_timeout_work, anc_wake_timeout_fn);
               if (anc_wake_dev)
                   return;
               anc_wake_dev = input_allocate_device();
@@ -445,7 +443,8 @@ jobs:
           static void anc_wake_unregister(void)
           {
               cancel_delayed_work_sync(&anc_rewake_work);
-              cancel_work_sync(&anc_unpress_work);
+              cancel_delayed_work_sync(&anc_wake_timeout_work);
+              anc_wake_pending = false;
               if (anc_wake_dev) {
                   input_unregister_device(anc_wake_dev);
                   anc_wake_dev = NULL;
@@ -457,6 +456,7 @@ jobs:
               if (!anc_wake_dev)
                   return;
               anc_wake_pending = true;
+              schedule_delayed_work(&anc_wake_timeout_work, msecs_to_jiffies(ANC_WAKE_TIMEOUT_MS));
               input_report_key(anc_wake_dev, KEY_WAKEUP, 1);
               input_sync(anc_wake_dev);
               input_report_key(anc_wake_dev, KEY_WAKEUP, 0);
@@ -472,7 +472,7 @@ jobs:
               s = s.replace(k, k + '        if (g_anc_data->fb_black)\n            anc_wake_screen();\n', 1)
               k = '        pr_info("[anc] Netlink touch up!");\n        netlink_send_message_to_user(&netlink_msg, sizeof(netlink_msg));\n'
               assert k in s
-              s = s.replace(k, k + '        if (anc_fp_press_set)\n            schedule_work(&anc_unpress_work);\n', 1)
+              s = s.replace(k, k + '        anc_wake_cancel();\n', 1)
               k = '                pr_info("[anc] NET SCREEN ON!\\n");\n                netlink_send_message_to_user(&netlink_msg, sizeof(netlink_msg));\n'
               assert k in s
               s = s.replace(k, k + '                if (anc_wake_pending)\n                    schedule_delayed_work(&anc_rewake_work, msecs_to_jiffies(ANC_REWAKE_DELAY_MS));\n', 1)
