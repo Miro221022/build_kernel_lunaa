@@ -352,6 +352,10 @@ jobs:
           # The KernelSU Next legacy-susfs driver uses CONFIG_SUSFS* (not CONFIG_KSU_SUSFS*)
           git status --porcelain | awk '{print $2}' | grep -E '\.(c|h)$|Makefile$|Kconfig$' | \
             xargs -r sed -i 's/CONFIG_KSU_SUSFS/CONFIG_SUSFS/g'
+          # fs/stat.c uses susfs_is_current_app_uid()/STATX_SUS_KSTAT* but the patch never includes the header there
+          grep -q 'linux/susfs_def.h' fs/stat.c || \
+            sed -i '0,/#include <asm\/unistd.h>/s||#include <asm/unistd.h>\n#ifdef CONFIG_SUSFS\n#include <linux/susfs_def.h>\n#endif|' fs/stat.c
+          grep -q 'linux/susfs_def.h' fs/stat.c
           rm -f susfs.patch
           test -f fs/susfs.c && test -f include/linux/susfs.h
           grep -q 'CONFIG_SUSFS' fs/Makefile
