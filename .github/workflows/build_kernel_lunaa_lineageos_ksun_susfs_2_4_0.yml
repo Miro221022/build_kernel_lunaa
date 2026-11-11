@@ -475,6 +475,54 @@ jobs:
               print('reboot hook added to kernel/reboot.c')
           PY
 
+      - name: Bring the KernelSU Next SUSFS driver up to SUSFS v2.4.0
+        if: ${{ inputs.ksu && inputs.susfs }}
+        working-directory: kernel/KernelSU-Next
+        run: |
+          set -euo pipefail
+          # The Gamesmes90 legacy-susfs driver predates SUSFS v2.4.0: it has no supercall for the
+          # new priority-uid filter (CMD_SUSFS_SET_PRIORITY_UID_FILTER 0x60030) and no Kconfig
+          # option for it, so the 2.4.0 kernel side would be built but could never be configured.
+          python3 - <<'PY'
+          import re
+          # --- Kconfig: new SUSFS v2.4.0 option
+          p = 'kernel/Kconfig'
+          s = open(p).read()
+          if 'config SUSFS_PRIORITY_UID_FILTER' not in s:
+              opt = '''config SUSFS_PRIORITY_UID_FILTER
+              bool "Enable to hide uids from apps that abuse the getpriority/setpriority syscalls"
+              depends on SUSFS
+              default y
+              help
+                  - SUSFS v2.4.0: hides the user-defined app uids (10000-19999) from the getpriority/setpriority uid probing.
+                  - Effective only on user app processes (uid >= 10000).
+
+          '''
+              k = 'endmenu\n'
+              i = s.index(k, s.index('menu "KernelSU - SUSFS"'))
+              s = s[:i] + opt + s[i:]
+              open(p, 'w').write(s)
+              print('Kconfig: SUSFS_PRIORITY_UID_FILTER added')
+          # --- supercall: CMD_SUSFS_SET_PRIORITY_UID_FILTER (0x60030)
+          p = 'kernel/supercall/supercall.c'
+          s = open(p).read()
+          if 'CMD_SUSFS_SET_PRIORITY_UID_FILTER' not in s:
+              k = '        if (cmd == CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING) {'
+              assert k in s, 'AVC log spoofing handler not found'
+              add = '''#ifdef CONFIG_SUSFS_PRIORITY_UID_FILTER
+                  if (cmd == CMD_SUSFS_SET_PRIORITY_UID_FILTER) {
+                      susfs_set_priority_uid_filter(arg);
+                      return 0;
+                  }
+          #endif // #ifdef CONFIG_SUSFS_PRIORITY_UID_FILTER
+          '''
+              s = s.replace(k, add + k, 1)
+              open(p, 'w').write(s)
+              print('supercall.c: CMD_SUSFS_SET_PRIORITY_UID_FILTER handler added')
+          PY
+          grep -q 'CMD_SUSFS_SET_PRIORITY_UID_FILTER' kernel/supercall/supercall.c
+          grep -q 'config SUSFS_PRIORITY_UID_FILTER' kernel/Kconfig
+
       - name: Clone clang
         run: |
           git clone --depth=1 -b "${{ inputs.clang_branch }}" \
@@ -510,7 +558,8 @@ jobs:
                 -e KPROBES -e OVERLAY_FS -e TMPFS_XATTR -e TMPFS_POSIX_ACL \
                 -e SUSFS -e SUSFS_SUS_PATH -e SUSFS_SUS_MOUNT -e SUSFS_SUS_KSTAT \
                 -e SUSFS_SPOOF_UNAME -e SUSFS_ENABLE_LOG -e SUSFS_HIDE_SUSFS_SYMBOLS \
-                -e SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG -e SUSFS_OPEN_REDIRECT -e SUSFS_SUS_MAP
+                -e SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG -e SUSFS_OPEN_REDIRECT -e SUSFS_SUS_MAP \
+                -e SUSFS_PRIORITY_UID_FILTER
             fi
           else
             scripts/config --file out/.config -d KSU
@@ -525,6 +574,7 @@ jobs:
             if [ "$WANT_SUSFS" = "true" ]; then
               grep -q '^CONFIG_SUSFS=y' out/.config || { echo "::error::CONFIG_SUSFS is not enabled"; exit 1; }
               grep -q '^CONFIG_SUSFS_SUS_MOUNT=y' out/.config || { echo "::error::SUSFS sub-options were not enabled"; exit 1; }
+              grep -q '^CONFIG_SUSFS_PRIORITY_UID_FILTER=y' out/.config || { echo "::error::SUSFS_PRIORITY_UID_FILTER was not enabled"; exit 1; }
             fi
             if [ "$HOOK_MODE" = "kprobes" ]; then
               grep -q '^CONFIG_KSU_KPROBES_HOOK=y' out/.config || { echo "::error::KPROBES hook not enabled"; exit 1; }
