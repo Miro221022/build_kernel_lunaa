@@ -605,7 +605,7 @@ jobs:
             fi
             if [ "$HOOK_MODE" = "manual" ]; then
               grep -q '^CONFIG_KSU_MANUAL_HOOK=y' out/.config || { echo "::error::MANUAL hook not enabled"; exit 1; }
-              grep -q '^CONFIG_KSU_KPROBES_HOOK=y' out/.config && { echo "::error::KPROBES hook still enabled"; exit 1; }
+              if grep -q '^CONFIG_KSU_KPROBES_HOOK=y' out/.config; then echo "::error::KPROBES hook still enabled"; exit 1; fi
             elif [ "$HOOK_MODE" = "kprobes" ]; then
               grep -q '^CONFIG_KSU_KPROBES_HOOK=y' out/.config || { echo "::error::KPROBES hook not enabled"; exit 1; }
             else
