@@ -96,6 +96,11 @@ on:
         type: boolean
         required: true
         default: true
+      susfs_extra:
+        description: "Also enable the 2 SUSFS v2.4.0 features the driver does not define (HIDE_KSU_SUSFS_SYMBOLS, PRIORITY_UID_FILTER). Turn off if the build fails in these files"
+        type: boolean
+        required: false
+        default: true
       hook_mode:
         description: "KernelSU hook mode"
         type: choice
@@ -390,6 +395,7 @@ jobs:
         working-directory: kernel
         env:
           HOOK_MODE: ${{ inputs.hook_mode }}
+          SUSFS_EXTRA: ${{ inputs.susfs_extra }}
           KSU_REPO: ${{ inputs.susfs && inputs.susfs_ksu_repo || inputs.ksu_repo }}
           KSU_BRANCH: ${{ inputs.susfs && inputs.susfs_ksu_branch || inputs.ksu_branch }}
           KSU_REF: ${{ inputs.susfs && inputs.susfs_ksu_ref || inputs.ksu_ref }}
@@ -419,6 +425,35 @@ jobs:
           grep -q kernelsu drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
           grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || \
             sed -i '$i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+
+          # SUSFS v2.4.0 reports 10 features, the driver's Kconfig only defines 8 of them:
+          #  - the kernel code checks CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS (-> CONFIG_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+          #    after the rename), the driver still has the old name SUSFS_HIDE_SUSFS_SYMBOLS
+          #  - PRIORITY_UID_FILTER is new in v2.4.0 and not defined at all
+          # Define both symbols here so olddefconfig keeps them (an undefined symbol is silently dropped).
+          SUSFS_EXTRA_DEFAULT=y; [ "$SUSFS_EXTRA" = "true" ] || SUSFS_EXTRA_DEFAULT=n
+          python3 - "$SUSFS_EXTRA_DEFAULT" <<'PY'
+          import sys
+          d = sys.argv[1]
+          p = 'KernelSU-Next/kernel/Kconfig'
+          s = open(p).read()
+          if 'SUSFS_HIDE_KSU_SUSFS_SYMBOLS' not in s and 'config SUSFS_SUS_MAP' in s:
+              add = (
+                  "config SUSFS_HIDE_KSU_SUSFS_SYMBOLS\n"
+                  "    bool \"Hide ksu and susfs symbols from /proc/kallsyms (SUSFS v2.4.0 name)\"\n"
+                  "    depends on SUSFS\n"
+                  "    default " + d + "\n\n"
+                  "config SUSFS_PRIORITY_UID_FILTER\n"
+                  "    bool \"Filter priority uids in ioprio_set/ioprio_get (SUSFS v2.4.0)\"\n"
+                  "    depends on SUSFS\n"
+                  "    default " + d + "\n\n"
+              )
+              a = s.index('config SUSFS_SUS_MAP')
+              b = s.index('endmenu', a)
+              s = s[:b] + add + s[b:]
+              open(p, 'w').write(s)
+              print('Kconfig: added SUSFS_HIDE_KSU_SUSFS_SYMBOLS and SUSFS_PRIORITY_UID_FILTER (default ' + d + ')')
+          PY
 
           # 5.4 has no linux/pgtable.h (added in 5.8); asm/pgtable.h is the 5.4 equivalent
           if [ ! -f include/linux/pgtable.h ]; then
@@ -562,6 +597,7 @@ jobs:
           EXTRA_CONFIGS: ${{ inputs.extra_configs }}
           WANT_KSU: ${{ inputs.ksu }}
           WANT_SUSFS: ${{ inputs.ksu && inputs.susfs }}
+          SUSFS_EXTRA: ${{ inputs.susfs_extra }}
           HOOK_MODE: ${{ inputs.hook_mode }}
         run: |
           export ARCH=arm64 SUBARCH=arm64
@@ -588,6 +624,9 @@ jobs:
                 -e SUSFS -e SUSFS_SUS_PATH -e SUSFS_SUS_MOUNT -e SUSFS_SUS_KSTAT \
                 -e SUSFS_SPOOF_UNAME -e SUSFS_ENABLE_LOG -e SUSFS_HIDE_SUSFS_SYMBOLS \
                 -e SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG -e SUSFS_OPEN_REDIRECT -e SUSFS_SUS_MAP
+          if [ "$SUSFS_EXTRA" = "true" ]; then
+            scripts/config --file out/.config -e SUSFS_HIDE_KSU_SUSFS_SYMBOLS -e SUSFS_PRIORITY_UID_FILTER
+          fi
             fi
           else
             scripts/config --file out/.config -d KSU
@@ -602,6 +641,10 @@ jobs:
             if [ "$WANT_SUSFS" = "true" ]; then
               grep -q '^CONFIG_SUSFS=y' out/.config || { echo "::error::CONFIG_SUSFS is not enabled"; exit 1; }
               grep -q '^CONFIG_SUSFS_SUS_MOUNT=y' out/.config || { echo "::error::SUSFS sub-options were not enabled"; exit 1; }
+              if [ "$SUSFS_EXTRA" = "true" ]; then
+                grep -q '^CONFIG_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y' out/.config || { echo "::error::SUSFS_HIDE_KSU_SUSFS_SYMBOLS not enabled"; exit 1; }
+                grep -q '^CONFIG_SUSFS_PRIORITY_UID_FILTER=y' out/.config || { echo "::error::SUSFS_PRIORITY_UID_FILTER not enabled"; exit 1; }
+              fi
             fi
             if [ "$HOOK_MODE" = "manual" ]; then
               grep -q '^CONFIG_KSU_MANUAL_HOOK=y' out/.config || { echo "::error::MANUAL hook not enabled"; exit 1; }
