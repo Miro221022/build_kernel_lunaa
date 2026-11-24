@@ -1,0 +1,472 @@
+name: Build kernel QUALLENAUGE built-in KSUN (lunaa, EvolutionX A17, kernel lineage-24-base-lunaa-rebase-qualle)
+
+# Kernel : Quallenauge/android_kernel_oneplus_sm8350, branch lineage-24-base-lunaa-rebase-qualle
+#          (head c8bea58fdcaf, 2026-10-25, 5.4.302). This is the kernel the ROM runs: `uname -r` on the phone
+#          is 5.4.302-qgki-gc8bea58fdcaf, and the ROM's vendor_dlkm modules match exactly that release.
+# KernelSU Next + SUSFS are ALREADY BUILT INTO this tree (drivers/kernelsu, "v3.4.2-legacy generation", UAPI 5,
+#          SUSFS v2.3.0, KPROBES hook mode, all enabled in vendor/lahaina-qgki_defconfig).
+#          Nothing is injected, patched or stripped here - the tree is built as its author ships it.
+# Manager: the driver speaks UAPI 5 -> the manager must be v3.4.2 (UAPI 5). The `dev` branch is UAPI 6 and does NOT work.
+#          By default the manager is NOT rebuilt (the kernel accepts the official KernelSU-Next signature).
+#          build_manager = true builds a manager with its own key and bakes that key into the kernel.
+# Not tested here: a full compile. Read the first errors if it fails.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: "Kernel repo (owner/name)"
+        required: true
+        default: "Quallenauge/android_kernel_oneplus_sm8350"
+      kernel_branch:
+        description: "Kernel branch"
+        required: true
+        default: "lineage-24-base-lunaa-rebase-qualle"
+      kernel_commit:
+        description: "Full commit SHA to build (default = c8bea58fdcaf, the kernel the ROM runs). Empty = current branch head (then clear expected_kernel_release or set the new one)"
+        required: false
+        default: "c8bea58fdcaf437eddce5871eec598acfa9ac8af"
+      defconfig:
+        description: "Base defconfig"
+        required: true
+        default: "vendor/lahaina-qgki_defconfig"
+      extra_configs:
+        description: "Config fragments merged on top (lunaa needs oplus_yupik)"
+        required: false
+        default: "vendor/oplus_yupik_QGKI.config"
+      expected_kernel_release:
+        description: "Must exactly match the installed ROM kernel release (adb shell uname -r). Empty = do not check"
+        required: false
+        default: "5.4.302-qgki-gc8bea58fdcaf"
+      scmversion:
+        description: "Kernel release suffix. Empty = -g<12-char HEAD hash>"
+        required: false
+        default: ""
+      ksu:
+        description: "Keep the built-in KernelSU Next (false = disable CONFIG_KSU, plain kernel for comparison)"
+        type: boolean
+        required: true
+        default: true
+      build_manager:
+        description: "Also build a manager APK signed with its own key and bake that key into the kernel (false = the kernel keeps accepting the official KernelSU-Next manager)"
+        type: boolean
+        required: true
+        default: false
+      manager_repo:
+        description: "KernelSU Next repo the manager is built from"
+        required: true
+        default: "KernelSU-Next/KernelSU-Next"
+      manager_ref:
+        description: "Tag/branch/commit of the manager. Must be UAPI 5 like the built-in driver (v3.4.1 and v3.4.2 are; dev is UAPI 6)"
+        required: true
+        default: "v3.4.2"
+      manager_spoofed:
+        description: "Build the spoofed manager (random package name)"
+        type: boolean
+        required: true
+        default: true
+      clang_repo:
+        description: "Clang toolchain git repo"
+        required: true
+        default: "https://github.com/kdrag0n/proton-clang"
+      clang_branch:
+        description: "Clang branch"
+        required: true
+        default: "master"
+
+jobs:
+  manager:
+    if: ${{ inputs.build_manager }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      cert_size: ${{ steps.sign.outputs.cert_size }}
+      cert_hash: ${{ steps.sign.outputs.cert_hash }}
+      uapi: ${{ steps.src.outputs.uapi }}
+    env:
+      # Optional repo secrets: a FIXED key lets new APKs update the installed manager.
+      # Without them a new throw-away key is made on every run (uninstall the old manager first).
+      KSU_KEYSTORE_B64: ${{ secrets.KSU_KEYSTORE_B64 }}
+      KSU_KEYSTORE_PASSWORD: ${{ secrets.KSU_KEYSTORE_PASSWORD }}
+      KSU_KEY_ALIAS: ${{ secrets.KSU_KEY_ALIAS }}
+      KSU_KEY_PASSWORD: ${{ secrets.KSU_KEY_PASSWORD }}
+    steps:
+      - name: Checkout KernelSU Next (manager + ksud)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.manager_repo }}
+          ref: ${{ inputs.manager_ref }}
+          path: KernelSU-Next
+          fetch-depth: 0
+
+      - name: Show manager source
+        id: src
+        working-directory: KernelSU-Next
+        run: |
+          git log -1 --format='Manager source: %h %ad %s' --date=short
+          git describe --tags --always
+          echo "commit count: $(git rev-list --count HEAD)"
+          UAPI="$(grep -oE 'KERNEL_SU_UAPI_VERSION[[:space:]=]+[0-9]+' uapi/supercall.h | grep -oE '[0-9]+$' | head -n1)"
+          echo "Manager source UAPI version: $UAPI"
+          [ -n "$UAPI" ]
+          echo "uapi=$UAPI" >> "$GITHUB_OUTPUT"
+
+      - name: Spoof package id
+        if: ${{ inputs.manager_spoofed }}
+        working-directory: KernelSU-Next/manager
+        run: |
+          chmod +x spoof
+          ./spoof
+
+      - name: Prepare signing key
+        id: sign
+        working-directory: KernelSU-Next/manager
+        run: |
+          set -euo pipefail
+          if [ -n "$KSU_KEYSTORE_B64" ]; then
+            echo "Using the keystore from repo secrets"
+            echo "$KSU_KEYSTORE_B64" | base64 -d > key.jks
+            STOREPASS="$KSU_KEYSTORE_PASSWORD"; ALIAS="$KSU_KEY_ALIAS"; KEYPASS="$KSU_KEY_PASSWORD"
+          else
+            echo "::warning::No KSU_KEYSTORE_B64 secret - generating a throw-away key. Uninstall the old manager before installing this APK."
+            STOREPASS="$(openssl rand -hex 12)"; ALIAS="ksunext"; KEYPASS="$STOREPASS"
+            keytool -genkeypair -keystore key.jks -alias "$ALIAS" -keyalg RSA -keysize 2048 \
+              -validity 36500 -storepass "$STOREPASS" -keypass "$KEYPASS" -dname "CN=KernelSU-Next"
+          fi
+          {
+            echo "KEYSTORE_FILE=key.jks"
+            echo "KEYSTORE_PASSWORD=$STOREPASS"
+            echo "KEY_ALIAS=$ALIAS"
+            echo "KEY_PASSWORD=$KEYPASS"
+          } >> gradle.properties
+
+          # What the kernel checks (kernel/manager/apk_sign.c): size and sha256 of the signing certificate (DER)
+          keytool -exportcert -keystore key.jks -alias "$ALIAS" -storepass "$STOREPASS" -file cert.der
+          SIZE="$(stat -c %s cert.der)"
+          HASH="$(sha256sum cert.der | cut -d' ' -f1)"
+          rm -f cert.der
+          echo "Certificate size: $SIZE"
+          echo "Certificate sha256: $HASH"
+          echo "cert_size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "cert_hash=$HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Set up NDK (ksud / bindgen)
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r29
+
+      - name: Set up Rust
+        run: |
+          rustup update stable
+          rustup target add aarch64-linux-android
+
+      - name: Install cross
+        run: RUSTFLAGS="" cargo install cross --git https://github.com/cross-rs/cross --rev 66845c1
+
+      - name: Assemble LKM bootstrap
+        working-directory: KernelSU-Next
+        run: |
+          clang --target=aarch64-linux-gnu -c -nostdlib \
+            -o userspace/ksud/.lkm_image_bootstrap.o \
+            userspace/ksud/src/lkm_image_bootstrap.S
+
+      - name: Build ksud (arm64)
+        working-directory: KernelSU-Next
+        env:
+          BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android: >-
+            --sysroot=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot
+            -I${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android
+            -I${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include
+        run: |
+          set -euxo pipefail
+          CROSS_NO_WARNINGS=0 cross build --target aarch64-linux-android --release \
+            --manifest-path ./userspace/ksud/Cargo.toml
+          KSUD_BIN="$(find userspace/ksud/target -path '*aarch64-linux-android/release/ksud' -type f | head -n1)"
+          test -n "$KSUD_BIN"
+          mkdir -p manager/app/src/main/jniLibs/arm64-v8a
+          install -m 755 "$KSUD_BIN" manager/app/src/main/jniLibs/arm64-v8a/libksud.so
+
+      - name: Build manager APK
+        working-directory: KernelSU-Next/manager
+        run: |
+          set -euxo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon clean assembleRelease
+          mkdir -p "$GITHUB_WORKSPACE/manager-apk"
+          cp app/build/outputs/apk/release/*.apk "$GITHUB_WORKSPACE/manager-apk/"
+          ls -lh "$GITHUB_WORKSPACE/manager-apk"
+
+      - name: Upload manager APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ksun-manager-apk-qualle
+          path: manager-apk/*.apk
+          if-no-files-found: error
+
+  build:
+    needs: manager
+    # run the kernel when the manager job succeeded OR was skipped (build_manager = false)
+    if: ${{ !cancelled() && (needs.manager.result == 'success' || needs.manager.result == 'skipped') }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev libncurses-dev \
+            cpio zip unzip git make gcc ccache lz4 zstd python3 \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Clone kernel source
+        env:
+          KERNEL_REPO: ${{ inputs.kernel_repo }}
+          KERNEL_BRANCH: ${{ inputs.kernel_branch }}
+          KERNEL_COMMIT: ${{ inputs.kernel_commit }}
+        run: |
+          touch build.log
+          git init -q kernel
+          cd kernel
+          git remote add origin "https://github.com/$KERNEL_REPO"
+          if [ -n "$KERNEL_COMMIT" ]; then
+            git fetch --depth=1 origin "$KERNEL_COMMIT"
+          else
+            git fetch --depth=1 origin "$KERNEL_BRANCH"
+          fi
+          git checkout -q --detach FETCH_HEAD
+          ACTUAL_COMMIT="$(git rev-parse HEAD)"
+          echo "Kernel commit: $ACTUAL_COMMIT"
+          if [ -n "$KERNEL_COMMIT" ] && [ "$ACTUAL_COMMIT" != "$KERNEL_COMMIT" ]; then
+            echo "::error::Fetched commit $ACTUAL_COMMIT != requested $KERNEL_COMMIT"; exit 1
+          fi
+          test -f arch/arm64/configs/vendor/lahaina-qgki_defconfig
+          test -f arch/arm64/configs/vendor/oplus_yupik_QGKI.config
+          test -f drivers/kernelsu/Kbuild   # KernelSU Next must be built into this tree
+          test -f include/linux/susfs.h
+
+      - name: Set kernel release suffix
+        working-directory: kernel
+        env:
+          SCMVERSION: ${{ inputs.scmversion }}
+        run: |
+          # Done before any file in the tree is touched (avoids a "-dirty" suffix).
+          if [ -n "$SCMVERSION" ]; then
+            SUFFIX="$SCMVERSION"
+          else
+            SUFFIX="-g$(git rev-parse --short=12 HEAD)"
+          fi
+          printf '%s' "$SUFFIX" > .scmversion
+          echo "scmversion: $SUFFIX"
+
+      - name: Show built-in KernelSU Next / SUSFS
+        working-directory: kernel
+        env:
+          MGR_UAPI: ${{ needs.manager.outputs.uapi }}
+        run: |
+          set -euo pipefail
+          grep -nE '^KSU_GIT_TAG|^KSU_VERSION_OVERRIDE|^KSU_GIT_VERSION ' drivers/kernelsu/Kbuild || true
+          grep -E '^#define SUSFS_VERSION' include/linux/susfs.h || true
+          UAPI="$(grep -rhoE 'KERNEL_SU_UAPI_VERSION[[:space:]=]+[0-9]+' drivers/kernelsu | grep -oE '[0-9]+$' | head -n1)"
+          echo "Built-in driver UAPI version: $UAPI"
+          if [ -n "$MGR_UAPI" ] && [ "$MGR_UAPI" != "$UAPI" ]; then
+            echo "::error::driver UAPI ($UAPI) != manager UAPI ($MGR_UAPI). Use manager_ref v3.4.1 or v3.4.2 (UAPI 5), not dev (UAPI 6)."
+            exit 1
+          fi
+
+      - name: Clone clang
+        run: |
+          git clone --depth=1 -b "${{ inputs.clang_branch }}" \
+            "${{ inputs.clang_repo }}" clang
+          echo "$GITHUB_WORKSPACE/clang/bin" >> "$GITHUB_PATH"
+
+      - name: Configure
+        working-directory: kernel
+        env:
+          DEFCONFIG: ${{ inputs.defconfig }}
+          EXTRA_CONFIGS: ${{ inputs.extra_configs }}
+          WANT_KSU: ${{ inputs.ksu }}
+        run: |
+          export ARCH=arm64 SUBARCH=arm64
+          MK="make O=out CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+
+          $MK "$DEFCONFIG"
+          for frag in $EXTRA_CONFIGS; do
+            $MK "$frag"
+          done
+
+          # KernelSU Next / SUSFS options come from the defconfig (kprobes hook mode). Only switch KSU off on request.
+          if [ "$WANT_KSU" != "true" ]; then
+            scripts/config --file out/.config -d KSU
+          fi
+          $MK olddefconfig
+
+          echo "--- resulting KernelSU config"
+          grep -E "^CONFIG_(SUSFS|KSU|KPROBES|KRETPROBES|KALLSYMS|LTO_CLANG|CFI_CLANG|LOCALVERSION)" out/.config || true
+
+          if [ "$WANT_KSU" = "true" ]; then
+            grep -q '^CONFIG_KSU=y' out/.config || { echo "::error::CONFIG_KSU is not enabled"; exit 1; }
+            grep -q '^CONFIG_KSU_SUSFS=y' out/.config || { echo "::error::CONFIG_KSU_SUSFS is not enabled"; exit 1; }
+          fi
+
+      - name: Build
+        working-directory: kernel
+        env:
+          # Kbuild: "ifndef KSU_NEXT_MANAGER_SIZE/HASH" -> an empty value keeps the official defaults.
+          # With build_manager the kernel accepts ONLY the APK built in the manager job.
+          KSU_NEXT_MANAGER_SIZE: ${{ needs.manager.outputs.cert_size }}
+          KSU_NEXT_MANAGER_HASH: ${{ needs.manager.outputs.cert_hash }}
+          EXPECTED_RELEASE: ${{ inputs.expected_kernel_release }}
+        run: |
+          export ARCH=arm64 SUBARCH=arm64
+          echo "Manager signature for the kernel: size=${KSU_NEXT_MANAGER_SIZE:-default} hash=${KSU_NEXT_MANAGER_HASH:-default}"
+          MK="make O=out CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+
+          # without pipefail the exit code of 'tee' hides a failed make
+          set -o pipefail
+          if ! $MK -j"$(nproc)" Image modules 2>&1 | tee -a ../build.log; then
+            echo "::group::First errors"
+            grep -nE "error:|\*\*\*|undefined reference" ../build.log | head -20 || true
+            echo "::endgroup::"
+            echo "::group::Single-threaded re-run for a readable error"
+            $MK -j1 Image 2>&1 | tail -n 40 || true
+            echo "::endgroup::"
+            echo "::error::Kernel build failed - see the first errors above and the build-log artifact"
+            exit 1
+          fi
+
+          $MK -j"$(nproc)" dtbs 2>&1 | tee -a ../build.log || true
+          ACTUAL_RELEASE="$(cat out/include/config/kernel.release)"
+          echo "Kernel release: $ACTUAL_RELEASE"
+          if [ -n "$EXPECTED_RELEASE" ] && [ "$ACTUAL_RELEASE" != "$EXPECTED_RELEASE" ]; then
+            echo "::error::Kernel release mismatch: expected $EXPECTED_RELEASE, got $ACTUAL_RELEASE"; exit 1
+          fi
+
+      - name: Verify result
+        working-directory: kernel
+        env:
+          WANT_KSU: ${{ inputs.ksu }}
+          KSU_NEXT_MANAGER_HASH: ${{ needs.manager.outputs.cert_hash }}
+        run: |
+          REL="$(cat out/include/config/kernel.release)"
+          echo "Kernel release: $REL"
+          if [ "$WANT_KSU" = "true" ]; then
+            grep -q ' ksu_' out/System.map || { echo "::error::no ksu_* symbols in System.map - KernelSU was not linked"; exit 1; }
+            echo "KernelSU symbols present: $(grep -c ' ksu_' out/System.map)"
+            grep -q ' susfs_' out/System.map || { echo "::error::no susfs_* symbols in System.map - SUSFS was not linked"; exit 1; }
+            echo "SUSFS symbols present: $(grep -c ' susfs_' out/System.map)"
+          fi
+          if [ -n "$KSU_NEXT_MANAGER_HASH" ]; then
+            grep -q "Manager signature hash: $KSU_NEXT_MANAGER_HASH" ../build.log || { echo "::error::custom manager signature hash was not picked up by Kbuild"; exit 1; }
+            echo "Custom manager signature is in the kernel"
+          fi
+          case "$REL" in
+            *-dirty) echo "::warning::kernel release ends with -dirty - vendor modules will not match the ROM" ;;
+          esac
+
+      - name: Package AnyKernel3 zip
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          rm -rf ak3/.git ak3/README.md ak3/LICENSE
+          cat > ak3/anykernel.sh <<'AKEOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=Custom kernel for lunaa / EvolutionX Android 17 (built-in KernelSU Next + SUSFS, Quallenauge tree)
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=lunaa
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=none;
+          PATCH_VBMETA_FLAG=auto;
+          NO_MAGISK_CHECK=1;
+
+          . tools/ak3-core.sh;
+
+          # The stock boot ramdisk is lz4_legacy and magiskboot's decompression
+          # of it aborts ("Splitting image failed"). Only the kernel is replaced,
+          # so keep the ramdisk bytes untouched: unpack with -n (no decompress);
+          # RAMDISK_COMPRESSION=none above makes repack use -n as well.
+          magiskboot() {
+            if [ "$1" = unpack ]; then
+              shift;
+              "$BIN/magiskboot" unpack -n "$@";
+            else
+              "$BIN/magiskboot" "$@";
+            fi;
+          }
+
+          split_boot;
+          flash_boot;
+          AKEOF
+          sed -i 's/^          //' ak3/anykernel.sh
+          cp kernel/out/arch/arm64/boot/Image ak3/Image
+          cd ak3
+          zip -r9 "../lunaa-evolutionx-kernel-qualle-$(date +%Y%m%d).zip" . -x '.git*'
+
+      - name: Collect modules
+        run: |
+          mkdir -p extra/modules
+          cp kernel/out/include/config/kernel.release extra/ || true
+          cp kernel/out/.config extra/config || true
+          find kernel/out -name '*.ko' -exec cp {} extra/modules/ \; 2>/dev/null || true
+          echo "Built modules: $(ls extra/modules | wc -l)"
+
+      - name: Summary
+        if: always()
+        env:
+          MGR_UAPI: ${{ needs.manager.outputs.uapi }}
+        run: |
+          {
+            echo "### Build summary (Quallenauge built-in KernelSU Next)"
+            echo "- Kernel commit: \`$(git -C kernel rev-parse --short=12 HEAD 2>/dev/null || echo n/a)\`"
+            echo "- Kernel release: \`$(cat kernel/out/include/config/kernel.release 2>/dev/null || echo n/a)\`"
+            echo "- KernelSU Next (built-in): \`$(grep -E '^KSU_GIT_TAG' kernel/drivers/kernelsu/Kbuild 2>/dev/null | sed 's/.*:= *//' || echo n/a)\`, version \`$(grep -E '^KSU_VERSION_OVERRIDE' kernel/drivers/kernelsu/Kbuild 2>/dev/null | sed 's/.*:= *//' || echo n/a)\`"
+            echo "- SUSFS: \`$(grep -E '^#define SUSFS_VERSION' kernel/include/linux/susfs.h 2>/dev/null | cut -d' ' -f3 || echo none)\`"
+            echo "- Manager APK: ${{ inputs.build_manager && 'built (artifact ksun-manager-apk-qualle)' || 'not built (official KernelSU-Next signature)' }}, manager UAPI: \`${MGR_UAPI:-n/a}\`"
+            grep -E "^CONFIG_(KSU|SUSFS)" kernel/out/.config 2>/dev/null | sed 's/^/    /' || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: lunaa-evolutionx-kernel-qualle
+          path: |
+            lunaa-evolutionx-kernel-qualle-*.zip
+
+      - name: Upload config, release string and modules
+        uses: actions/upload-artifact@v4
+        with:
+          name: lunaa-config-and-modules-qualle
+          path: extra/
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-qualle
+          path: build.log
+          if-no-files-found: ignore
